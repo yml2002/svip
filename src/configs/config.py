@@ -19,7 +19,8 @@ class DataConfig:
     max_persons: int = 20
     image_height: int = 192
     image_width: int = 336
-    cache_data: bool = True  # 设置True为启用特征缓存
+    cache_data: bool = False
+    # cache_data: bool = True  # 设置True为启用特征缓存
     max_samples: Optional[int] = None
     data_ratio: float = 1.0
 
@@ -31,12 +32,20 @@ class DropoutConfig:
     temporal: float = 0.20
     scoring: float = 0.20
     gate: float = 0.20
+    st_graph: float = 0.15  # 时空图
 
 
 @dataclass
 class BBoxGeomConfig:
+    """BBox几何特征编码.
+    
+    功能: 14维基础特征 (x,y,w,h,area,运动等) → feature_dim
+    设计:
+    - feature_dim=256: 辅助特征，不应过大 (vs DINOv2 768维)
+    - hidden_dim=256: 匹配14维输入的简单性 (18x扩张，原36x过大)
+    """
     feature_dim: int = 256
-    hidden_dim: int = 512
+    hidden_dim: int = 256  # 匹配14维输入的简单性
 
 
 @dataclass
@@ -44,12 +53,18 @@ class DinoConfig:
     """DINO (HuggingFace) settings (offline-only).
 
     Example local directory: `data/models/dinov2-base`.
+    
+    微调策略 (基于SVM分析):
+    - freeze=False: 启用微调 (SVM 75.86% > 深度模型 68.32% → 需要任务特定特征)
+    - finetune_layers=2: 仅微调最后2层 (12层总共, ~17%参数)
+    - 降低过拟合风险,同时适配MSG-VIP任务
     """
 
     enabled: bool = True
     model_dir: str = "data/models/dinov2-base"
     feature_dim: int = 768
-    freeze: bool = True
+    freeze: bool = False  # 启用微调
+    finetune_layers: int = 2  # 恢复峰值能力
     image_size: int = 192
 
 
@@ -61,33 +76,74 @@ class FeatureConfig:
 
 
 @dataclass
+class SpatiotemporalGraphConfig:
+    """Unified spatiotemporal graph modeling - 时空联合建模.
+    
+    设计理念 (基于SVM 75.86%的启示):
+    - hidden_dim=768: 适度压缩 (1024→76825%), 平衡信息保留和泛化
+    - num_layers=2: 问题接近线性可分，不需要太深
+    - num_heads=12: 适配768维 (64维/head, 标准设置)
+    - 参数量: ~15M (原6.8M的2.2x, 避免过拟合)
+    - dropout: 从DroupoutConfig.st_graph统一管理
+    """
+    enabled: bool = True  # 启用新架构
+    hidden_dim: int = 768  # 适度压缩25%
+    num_layers: int = 2  # 小数据集下更稳健
+    num_heads: int = 12  # 12头 (768/12=64维/head)
+    temporal_window: int = 10  # 时序窗口：前后10帧
+    
+    # Memory optimization for large sequences
+    use_chunked_attention: bool = True  # 启用分块attention（省显存）
+    chunk_size: int = 30  # 每次处理30帧
+    chunk_threshold: int = 1000  # TN>1000时启用chunking
+
+
+@dataclass
 class GATv2Config:
-    enabled: bool = True
+    enabled: bool = False  # 替换为时空图
     hidden_dim: int = 512
-    num_layers: int = 2
+    num_layers: int = 3
     heads: int = 4
     use_residual: bool = True
 
 
 @dataclass
 class TemporalTransformerConfig:
-    enabled: bool = True
+    """Temporal modeling config.
+    
+    Event Token设计理念:
+    - ST-Graph: bottom-up, 局部时空交互 (person-centric)
+    - Event Token: top-down, 全局事件语义 (event-centric)
+    - 互补关系: 个体特征 + 事件上下文 = 在该事件中的重要度
+    """
+    enabled: bool = False  # 被ST-Graph替代
     d_model: int = 768
-    nhead: int = 12
-    num_layers: int = 2
+    nhead: int = 8
+    num_layers: int = 1
     dim_feedforward: int = 1024
-    use_event_token: bool = True
+    
+    # Event Token配置
+    use_event_token: bool = True  # 启用hierarchical event context
+    event_type: str = "segment"  # "segment" (hierarchical) or "frame" (legacy)
+    num_segments: int = 6  # 120帧/6 = 20帧/段
+    event_dim: int = 512  # Event token维度
     event_num_layers: int = 1
     agg_heads: int = 4
     agg_out_dim: int = 512
-    pooling: Optional[str] = "mean"
+    pooling: Optional[str] = "attention"
     transformer_layers: int = 1
-    use_video_transformer: bool = True
+    use_video_transformer: bool = False  # 时空图已包含
 
 
 @dataclass
 class ScoringConfig:
-    hidden_dim: int = 128
+    """评分模块配置.
+    
+    设计理念:
+    - hidden_dim=256: 减少从512的压缩率 (原128太小)
+    - SVM用全部512维达到75.86%，说明维度很重要
+    """
+    hidden_dim: int = 512  # 提升评分表达,冲峰值
     temperature: float = 1.0
 
 
@@ -105,6 +161,7 @@ class ModelConfig:
     dropout: DropoutConfig = field(default_factory=DropoutConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
     gatv2: GATv2Config = field(default_factory=GATv2Config)
+    st_graph: SpatiotemporalGraphConfig = field(default_factory=SpatiotemporalGraphConfig)
     temporal: TemporalTransformerConfig = field(default_factory=TemporalTransformerConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
     loss: LossConfig = field(default_factory=LossConfig)
@@ -118,11 +175,11 @@ class TrainingConfig:
     min_lr: float = 1e-5
 
     num_epochs: int = 30
-    batch_size: int = 8
+    batch_size: int = 16
     accumulation_steps: int = 2
     roi_chunk: int = 256
 
-    enable_dual_head: bool = True
+    enable_dual_head: bool = True  # 保留dual head
     gate_hidden_dim: int = 128
 
     use_mixed_precision: bool = True

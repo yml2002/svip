@@ -20,6 +20,7 @@ class VisionEncoder(nn.Module):
         out_dim: Optional[int] = None,
         image_size: int = 224,
         freeze: bool = True,
+        finetune_layers: int = 0,
     ) -> None:
         super().__init__()
         self.image_size = int(image_size)
@@ -57,9 +58,30 @@ class VisionEncoder(nn.Module):
         else:
             self.out_dim = self.backbone_dim
 
+        # 微调策略: freeze=False + finetune_layers > 0 表示部分层微调
         if freeze:
+            # 完全冻结
             for p in self.backbone.parameters():
                 p.requires_grad = False
+        elif finetune_layers > 0:
+            # 部分微调: 冻结前面层,仅微调最后 finetune_layers 层
+            # DINOv2 结构: encoder.layer[0..11] (12层)
+            for p in self.backbone.parameters():
+                p.requires_grad = False  # 先全冻结
+            
+            # 解冻最后几层
+            if hasattr(self.backbone, 'encoder') and hasattr(self.backbone.encoder, 'layer'):
+                total_layers = len(self.backbone.encoder.layer)
+                unfreeze_from = max(0, total_layers - finetune_layers)
+                for i in range(unfreeze_from, total_layers):
+                    for p in self.backbone.encoder.layer[i].parameters():
+                        p.requires_grad = True
+                print(f"[VisionEncoder] 微调最后 {finetune_layers}/{total_layers} 层 (layer {unfreeze_from}..{total_layers-1})")
+            else:
+                print("[VisionEncoder] 警告: 无法识别 encoder.layer 结构,启用全模型微调")
+                for p in self.backbone.parameters():
+                    p.requires_grad = True
+        # else: freeze=False and finetune_layers=0 → 全模型微调
 
     def forward(self, crops: torch.Tensor) -> torch.Tensor:
         x = crops

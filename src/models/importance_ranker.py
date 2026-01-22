@@ -11,9 +11,11 @@ import torch.nn.functional as F
 
 from src.models.bbox_geom import BBoxGeomEncoder
 from src.models.event_context import EventTokenContext
+from src.models.segment_event_context import SegmentEventContext
 from src.models.vision_encoder import VisionEncoder
 from src.models.gatv2 import GATv2Stack
 from src.models.video_aggregator import VideoLevelAggregator
+from src.models.spatiotemporal_graph import SpatiotemporalGraphTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +131,7 @@ class ImportanceRanker(nn.Module):
             out_dim=int(dino_cfg.feature_dim),
             image_size=int(dino_cfg.image_size),
             freeze=bool(dino_cfg.freeze),
+            finetune_layers=int(getattr(dino_cfg, "finetune_layers", 0)),
         )
 
         self.geom = BBoxGeomEncoder(out_dim=int(geom_cfg.feature_dim), hidden_dim=int(geom_cfg.hidden_dim))
@@ -140,24 +143,46 @@ class ImportanceRanker(nn.Module):
             nn.Dropout(float(config.model.dropout.features)),
         )
 
-        self.gat = GATv2Stack(
-            in_dim=int(feat_cfg.fused_dim),
-            hidden_dim=int(gat_cfg.hidden_dim),
-            num_layers=int(gat_cfg.num_layers),
-            heads=int(gat_cfg.heads),
-            dropout=float(config.model.dropout.gatv2),
-            use_residual=bool(gat_cfg.use_residual),
-        )
-
-
-
-        self.temporal_encoder = TemporalEncoder(
-            d_model=int(tmp_cfg.d_model),
-            nhead=int(tmp_cfg.nhead),
-            num_layers=int(tmp_cfg.num_layers),
-            dim_feedforward=int(tmp_cfg.dim_feedforward),
-            dropout=float(config.model.dropout.temporal),
-        )
+        # Choose between GATv2 (old) or Spatiotemporal Graph (new)
+        st_cfg = getattr(config.model, "st_graph", None)
+        use_st_graph = st_cfg and bool(st_cfg.enabled)
+        
+        if use_st_graph:
+            logger.info("Using Spatiotemporal Graph Transformer")
+            self.st_graph = SpatiotemporalGraphTransformer(
+                input_dim=int(feat_cfg.fused_dim),
+                hidden_dim=int(st_cfg.hidden_dim),
+                num_layers=int(st_cfg.num_layers),
+                num_heads=int(st_cfg.num_heads),
+                dropout=float(config.model.dropout.st_graph),  # 从统一的DropoutConfig读取
+                temporal_window=int(st_cfg.temporal_window),
+                use_chunked_attention=bool(getattr(st_cfg, 'use_chunked_attention', True)),
+                chunk_size=int(getattr(st_cfg, 'chunk_size', 30)),
+                chunk_threshold=int(getattr(st_cfg, 'chunk_threshold', 1000)),
+            )
+            # Output from ST graph goes directly to aggregation
+            self.to_dmodel = nn.Linear(int(st_cfg.hidden_dim), int(tmp_cfg.d_model))
+            self.use_st_graph = True
+        else:
+            logger.info("Using legacy GATv2 + Temporal Transformer")
+            self.gat = GATv2Stack(
+                in_dim=int(feat_cfg.fused_dim),
+                hidden_dim=int(gat_cfg.hidden_dim),
+                num_layers=int(gat_cfg.num_layers),
+                heads=int(gat_cfg.heads),
+                dropout=float(config.model.dropout.gatv2),
+                use_residual=bool(gat_cfg.use_residual),
+            )
+            
+            self.temporal_encoder = TemporalEncoder(
+                d_model=int(tmp_cfg.d_model),
+                nhead=int(tmp_cfg.nhead),
+                num_layers=int(tmp_cfg.num_layers),
+                dim_feedforward=int(tmp_cfg.dim_feedforward),
+                dropout=float(config.model.dropout.temporal),
+            )
+            self.to_dmodel = nn.Linear(int(gat_cfg.hidden_dim), int(tmp_cfg.d_model))
+            self.use_st_graph = False
 
         agg_heads = int(getattr(tmp_cfg, "agg_heads", 8))
         agg_out = int(getattr(tmp_cfg, "agg_out_dim", int(tmp_cfg.d_model)))
@@ -176,20 +201,43 @@ class ImportanceRanker(nn.Module):
         )
 
         self.use_event_token = bool(getattr(tmp_cfg, "use_event_token", True))
-        event_layers = int(getattr(tmp_cfg, "event_num_layers", 1))
+        self.event_type = str(getattr(tmp_cfg, "event_type", "segment"))
+        
         if self.use_event_token:
-            self.event_ctx = EventTokenContext(
-                d_model=int(tmp_cfg.d_model),
-                nhead=int(tmp_cfg.nhead),
-                dim_feedforward=int(tmp_cfg.dim_feedforward),
-                dropout=float(config.model.dropout.temporal),
-                event_num_layers=event_layers,
-            )
-
-        self.to_dmodel = nn.Linear(int(gat_cfg.hidden_dim), int(tmp_cfg.d_model))
+            if self.event_type == "segment":
+                # Use hierarchical segment-level event modeling (recommended)
+                num_segments = int(getattr(tmp_cfg, "num_segments", 6))
+                event_dim = int(getattr(tmp_cfg, "event_dim", 512))
+                event_layers = int(getattr(tmp_cfg, "event_num_layers", 1))
+                
+                logger.info(
+                    "Using SegmentEventContext: num_segments=%d, event_dim=%d, layers=%d",
+                    num_segments, event_dim, event_layers
+                )
+                
+                self.event_ctx = SegmentEventContext(
+                    d_model=int(tmp_cfg.d_model),
+                    event_dim=event_dim,
+                    num_segments=num_segments,
+                    nhead=int(tmp_cfg.nhead),
+                    dropout=float(config.model.dropout.temporal),
+                    event_num_layers=event_layers,
+                )
+            else:
+                # Legacy frame-level event modeling
+                event_layers = int(getattr(tmp_cfg, "event_num_layers", 1))
+                logger.info("Using frame-level EventTokenContext (legacy)")
+                
+                self.event_ctx = EventTokenContext(
+                    d_model=int(tmp_cfg.d_model),
+                    nhead=int(tmp_cfg.nhead),
+                    dim_feedforward=int(tmp_cfg.dim_feedforward),
+                    dropout=float(config.model.dropout.temporal),
+                    event_num_layers=event_layers,
+                )
 
         self.dual_head = bool(getattr(config.training, "enable_dual_head", False))
-        if self.dual_head:
+        if self.dual_head and not use_st_graph:
             self.self_to_dmodel = nn.Linear(int(feat_cfg.fused_dim), int(tmp_cfg.d_model))
             self.self_scoring = nn.Sequential(
                 nn.Linear(int(tmp_cfg.agg_out_dim), int(sc_cfg.hidden_dim)),
@@ -283,36 +331,56 @@ class ImportanceRanker(nn.Module):
 
         fused = self.fuse(torch.cat([vis_feats, geom_feats], dim=-1)).masked_fill(~pm.unsqueeze(-1), 0.0)
 
-        social = self.gat(fused, pm)
-
-        # Transformer 的时间 mask 是“该 person 在该帧是否有效”
-        pm_bt = pm.permute(0, 2, 1).reshape(B * N, T)
-
-        rel_tokens = self.temporal_encoder(
-            self.to_dmodel(social).permute(0, 2, 1, 3).reshape(B * N, T, -1),
-            pm_bt,
-        ).reshape(B, N, T, -1).permute(0, 2, 1, 3)  # (B,T,N,D)
-
-        if self.use_event_token:
-            rel_tokens = self.event_ctx(rel_tokens, pm).masked_fill(~pm.unsqueeze(-1), 0.0)
-
-        rel_pooled = self.temporal_agg(rel_tokens, pm)  # (B,N,D)
-
-        valid_mask = pm.any(dim=1)
-
-        if self.dual_head:
-            self_tokens = self.temporal_encoder(
-                self.self_to_dmodel(fused).permute(0, 2, 1, 3).reshape(B * N, T, -1),
-                pm_bt,
-            ).reshape(B, N, T, -1).permute(0, 2, 1, 3)
-
-            self_pooled = self.temporal_agg(self_tokens, pm)
-            self_logits = self.self_scoring(self_pooled).squeeze(-1)
-            rel_logits = self.scoring(rel_pooled).squeeze(-1)
-            gate = torch.sigmoid(self.gate_mlp(torch.cat([self_pooled, rel_pooled], dim=-1)).squeeze(-1))
-            logits = (1.0 - gate) * self_logits + gate * rel_logits
-        else:
+        if self.use_st_graph:
+            # New: Spatiotemporal Graph Transformer
+            # Unified space-time interaction modeling
+            st_features = self.st_graph(fused, pm)  # (B, T, N, hidden_dim)
+            
+            # Project to d_model
+            st_proj = self.to_dmodel(st_features)  # (B, T, N, d_model)
+            
+            # Optional: Global event context
+            if self.use_event_token:
+                st_proj = self.event_ctx(st_proj, pm).masked_fill(~pm.unsqueeze(-1), 0.0)
+            
+            # Video-level aggregation
+            rel_pooled = self.temporal_agg(st_proj, pm)  # (B, N, agg_out_dim)
+            
+            valid_mask = pm.any(dim=1)
             logits = self.scoring(rel_pooled).squeeze(-1)
+            
+        else:
+            # Legacy: GATv2 (spatial) + Temporal Transformer (separate)
+            social = self.gat(fused, pm)
+
+            # Transformer 的时间 mask 是"该 person 在该帧是否有效"
+            pm_bt = pm.permute(0, 2, 1).reshape(B * N, T)
+
+            rel_tokens = self.temporal_encoder(
+                self.to_dmodel(social).permute(0, 2, 1, 3).reshape(B * N, T, -1),
+                pm_bt,
+            ).reshape(B, N, T, -1).permute(0, 2, 1, 3)  # (B,T,N,D)
+
+            if self.use_event_token:
+                rel_tokens = self.event_ctx(rel_tokens, pm).masked_fill(~pm.unsqueeze(-1), 0.0)
+
+            rel_pooled = self.temporal_agg(rel_tokens, pm)  # (B,N,D)
+
+            valid_mask = pm.any(dim=1)
+
+            if self.dual_head:
+                self_tokens = self.temporal_encoder(
+                    self.self_to_dmodel(fused).permute(0, 2, 1, 3).reshape(B * N, T, -1),
+                    pm_bt,
+                ).reshape(B, N, T, -1).permute(0, 2, 1, 3)
+
+                self_pooled = self.temporal_agg(self_tokens, pm)
+                self_logits = self.self_scoring(self_pooled).squeeze(-1)
+                rel_logits = self.scoring(rel_pooled).squeeze(-1)
+                gate = torch.sigmoid(self.gate_mlp(torch.cat([self_pooled, rel_pooled], dim=-1)).squeeze(-1))
+                logits = (1.0 - gate) * self_logits + gate * rel_logits
+            else:
+                logits = self.scoring(rel_pooled).squeeze(-1)
 
         logits = logits.masked_fill(~valid_mask, -1e4)
 
@@ -324,7 +392,8 @@ class ImportanceRanker(nn.Module):
             "video_features": rel_pooled,
         }
 
-        if self.dual_head:
+        # Only add dual_head outputs if they were computed (legacy branch with dual_head enabled)
+        if not self.use_st_graph and self.dual_head:
             out["importance_logits_self"] = self_logits
             out["importance_logits_rel"] = rel_logits
         return out

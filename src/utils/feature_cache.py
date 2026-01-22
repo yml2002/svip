@@ -202,7 +202,7 @@ class CachedFeatureDataset:
         return len(self.sample_files)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return torch.load(self.sample_files[idx])
+        return torch.load(self.sample_files[idx], weights_only=False)
 
 
 def should_use_cache(config: Any) -> bool:
