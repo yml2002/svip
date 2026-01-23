@@ -30,7 +30,7 @@ class DropoutConfig:
     features: float = 0.10
     gatv2: float = 0.10
     temporal: float = 0.20
-    scoring: float = 0.25
+    scoring: float = 0.20
     gate: float = 0.20
     st_graph: float = 0.15  # 时空图
 
@@ -152,7 +152,7 @@ class LossConfig:
     beta: float = 1.0
     importance_weight: float = 1.0
     preference_weight: float = 0.3
-    pairwise_weight: float = 0.05
+    pairwise_weight: float = 0.0
     pairwise_margin: float = 0.2
 
 

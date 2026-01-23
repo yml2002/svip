@@ -139,6 +139,7 @@ class ImportanceRanker(nn.Module):
         fused_in = int(dino_cfg.feature_dim) + int(geom_cfg.feature_dim)
         self.fuse = nn.Sequential(
             nn.Linear(fused_in, int(feat_cfg.fused_dim)),
+            nn.LayerNorm(int(feat_cfg.fused_dim)),
             nn.ReLU(inplace=True),
             nn.Dropout(float(config.model.dropout.features)),
         )
