@@ -1,12 +1,16 @@
+# 忽略所有文件和目录
 *
+
+# 允许以下关键项
 !/src/
 !/data/models/
 !/README.md
 
-/src/**
-/data/models/**
+# 允许它们的内容被递归追踪（注意加 !）
+!/src/**
+!/data/models/**
 
-# 清理垃圾
+# 可选：清理常见垃圾文件
 **/__pycache__/
 **/*.pyc
 **/.DS_Store
