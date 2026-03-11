@@ -66,10 +66,7 @@ def configure_cuda_allocator() -> None:
     if os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or not torch.cuda.is_available():
         return
 
-    allocator_parts = ["max_split_size_mb:64"]
-    if os.environ.get("MSGVIP_USE_EXPANDABLE_SEGMENTS") == "1":
-        allocator_parts.append("expandable_segments:True")
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(allocator_parts)
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64,expandable_segments:True"
 
 
 def resolve_data_path(path_str: str) -> str:
