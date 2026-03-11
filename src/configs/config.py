@@ -92,9 +92,6 @@ class LossConfig:
     beta: float = 1.0
     importance_weight: float = 1.0
     preference_weight: float = 0.3
-    cf_influence_weight: float = 0.05
-    cf_topk: int = 3
-    cf_margin: float = 0.1
 
 
 @dataclass

@@ -219,15 +219,6 @@ class TrainingRuntime:
             config.model.loss.importance_weight = float(self.args.importance_weight)
         if getattr(self.args, "preference_weight", None) is not None:
             config.model.loss.preference_weight = float(self.args.preference_weight)
-        if getattr(self.args, "cf_influence_weight", None) is not None:
-            config.model.loss.cf_influence_weight = float(self.args.cf_influence_weight)
-        if getattr(self.args, "cf_topk", None) is not None:
-            cf_topk = int(self.args.cf_topk)
-            if cf_topk <= 0:
-                raise ValueError(f"cf_topk must be > 0, got {cf_topk}")
-            config.model.loss.cf_topk = cf_topk
-        if getattr(self.args, "cf_margin", None) is not None:
-            config.model.loss.cf_margin = float(self.args.cf_margin)
         if getattr(self.args, "logit_temperature", None) is not None:
             config.model.scoring.temperature = float(self.args.logit_temperature)
 

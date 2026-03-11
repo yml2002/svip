@@ -83,64 +83,6 @@ def compute_rankk_global(
 logger = logging.getLogger(__name__)
 
 
-def _build_cf_candidate_indices_topk(
-    importance_logits: torch.Tensor,
-    person_mask: torch.Tensor,
-    target_index: torch.Tensor,
-    k: int,
-) -> torch.Tensor:
-    """Build candidate set [target, top-(k-1) non-target negatives]."""
-    valid_mask = person_mask.any(dim=1) if person_mask.dim() == 3 else person_mask.bool()
-    B, N = importance_logits.shape
-    k_eff = max(1, min(int(k), int(N)))
-
-    t = target_index.long()
-    out = torch.full((B, k_eff), -1, dtype=torch.long, device=importance_logits.device)
-    out[:, 0] = t
-    if k_eff == 1:
-        return out
-
-    neg_logits = importance_logits.masked_fill(~valid_mask, -1e4)
-    neg_logits = neg_logits.clone()
-    neg_logits.scatter_(1, t.unsqueeze(1), -1e4)
-    top_neg = neg_logits.topk(k=k_eff - 1, dim=1).indices
-    out[:, 1:] = top_neg
-    return out
-
-
-def _compute_cf_target_logits_topk(
-    trainer,
-    batch: Dict[str, torch.Tensor],
-    candidate_indices_topk: torch.Tensor,
-) -> torch.Tensor:
-    """Run explicit interventions by removing one candidate at a time.
-
-    This path is intentionally no-grad to keep CF regularization lightweight.
-    Gradients are kept only through factual logits in the CF loss.
-    """
-    B, K = candidate_indices_topk.shape
-    target = batch["target_index"].long()
-    cf_target_logits: List[torch.Tensor] = []
-
-    with torch.no_grad():
-        with amp.autocast(device_type=trainer.device.type, enabled=trainer.use_mixed_precision):
-            for j in range(K):
-                pm_cf = batch["person_mask"].clone()
-                b_idx = torch.arange(B, device=pm_cf.device)
-                p_idx = candidate_indices_topk[:, j]
-                pm_cf[b_idx, :, p_idx] = False
-
-                outputs_cf = trainer.model(
-                    frames=batch["frames"],
-                    bboxes=batch["bboxes"],
-                    person_mask=pm_cf,
-                    target_index=batch["target_index"],
-                )
-                target_cf = outputs_cf["importance_logits"].gather(1, target.unsqueeze(1)).squeeze(1)
-                cf_target_logits.append(target_cf)
-
-    return torch.stack(cf_target_logits, dim=1)
-
 def export_predictions_csv(
     *,
     trainer,
@@ -167,14 +109,13 @@ def export_predictions_csv(
     )
 
 
-def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, float, float]:
+def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, float]:
     trainer.model.train()
     trainer.optimizer.zero_grad(set_to_none=True)
 
     epoch_loss = 0.0
     epoch_imp_loss = 0.0
     epoch_pref_loss = 0.0
-    epoch_cf_loss = 0.0
     num_batches = 0
     running_correct = 0
     running_total = 0
@@ -211,24 +152,10 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
                 debug_batch_idx=batch_idx,
             )
 
-            additional_outputs = dict(outputs)
-            if float(getattr(trainer.loss_function, "cf_influence_weight", 0.0)) > 0.0:
-                cf_topk = int(getattr(trainer.loss_function, "cf_topk", 3))
-                candidate_indices_topk = _build_cf_candidate_indices_topk(
-                    outputs["importance_logits"],
-                    batch["person_mask"],
-                    batch["target_index"],
-                    k=cf_topk,
-                )
-                cf_target_logits_topk = _compute_cf_target_logits_topk(trainer, batch, candidate_indices_topk)
-                additional_outputs["cf_candidate_indices_topk"] = candidate_indices_topk
-                additional_outputs["cf_target_logits_topk"] = cf_target_logits_topk
-
             loss_components = trainer.loss_function.get_loss_components(
                 importance_logits=outputs["importance_logits"],
                 target_index=batch["target_index"],
                 person_mask=batch["person_mask"],
-                additional_outputs=additional_outputs,
             )
             loss = loss_components["total_loss"] / trainer.accumulation_steps
 
@@ -261,7 +188,6 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
         epoch_loss += loss_value
         epoch_imp_loss += float(loss_components["importance_loss"].item())
         epoch_pref_loss += float(loss_components["preference_loss"].item())
-        epoch_cf_loss += float(loss_components.get("cf_influence_loss", 0.0).item())
         num_batches += 1
 
         acc_metrics = compute_accuracy_metrics(outputs["importance_logits"], batch["target_index"], batch["person_mask"])
@@ -349,18 +275,16 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
 
     avg_imp_loss = epoch_imp_loss / max(1, num_batches)
     avg_pref_loss = epoch_pref_loss / max(1, num_batches)
-    avg_cf_loss = epoch_cf_loss / max(1, num_batches)
-    return avg_loss, avg_acc, avg_imp_loss, avg_pref_loss, avg_cf_loss
+    return avg_loss, avg_acc, avg_imp_loss, avg_pref_loss
 
 
 @torch.no_grad()
-def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, float, float, float, float, float]:
+def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, float, float, float, float]:
     trainer.model.eval()
 
     epoch_loss = 0.0
     epoch_imp_loss = 0.0
     epoch_pref_loss = 0.0
-    epoch_cf_loss = 0.0
     num_batches = 0
     running_correct = 0
     running_total = 0
@@ -405,21 +329,16 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
                 target_index=batch["target_index"],
             )
 
-            # Validation skips explicit CF intervention branch to avoid extra compute.
-            additional_outputs = dict(outputs)
-
             loss_components = trainer.loss_function.get_loss_components(
                 importance_logits=outputs["importance_logits"],
                 target_index=batch["target_index"],
                 person_mask=batch["person_mask"],
-                additional_outputs=additional_outputs,
             )
 
         loss_value = float(loss_components["total_loss"].item())
         epoch_loss += loss_value
         epoch_imp_loss += float(loss_components["importance_loss"].item())
         epoch_pref_loss += float(loss_components["preference_loss"].item())
-        epoch_cf_loss += float(loss_components.get("cf_influence_loss", 0.0).item())
         num_batches += 1
 
         acc_metrics = compute_accuracy_metrics(outputs["importance_logits"], batch["target_index"], batch["person_mask"])
@@ -481,7 +400,6 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
 
     avg_imp_loss = epoch_imp_loss / max(1, num_batches)
     avg_pref_loss = epoch_pref_loss / max(1, num_batches)
-    avg_cf_loss = epoch_cf_loss / max(1, num_batches)
 
     local_top3 = torch.cat(pred_top3, dim=0)
     local_targets = torch.cat(pred_targets, dim=0)
@@ -502,7 +420,7 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
 
         if trainer.rank != 0:
             # Non-main ranks don't compute global metrics/export.
-            return avg_loss, avg_acc, 0.0, 0.0, 0.0, avg_imp_loss, avg_pref_loss, avg_cf_loss
+            return avg_loss, avg_acc, 0.0, 0.0, 0.0, avg_imp_loss, avg_pref_loss
 
         targets_all = torch.cat([g["targets"] for g in gathered if g is not None], dim=0)
         top3_all = torch.cat([g["top3"] for g in gathered if g is not None], dim=0)
@@ -627,4 +545,4 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
     trainer.record_logger.log_classwise_metrics(int(trainer.current_epoch) + 1, classwise)
     # Attach bucketed rank@k for trainer logging if available.
     trainer._rank_by_k = rank_by_k
-    return avg_loss, avg_acc, rank1, rank2, rank3, avg_imp_loss, avg_pref_loss, avg_cf_loss
+    return avg_loss, avg_acc, rank1, rank2, rank3, avg_imp_loss, avg_pref_loss

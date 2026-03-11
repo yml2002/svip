@@ -18,25 +18,25 @@ from src.models.video_aggregator import VideoLevelAggregator
 logger = logging.getLogger(__name__)
 
 
-def roi_crop_batch(
+def roi_crop_valid_batch(
     frames: torch.Tensor,  # (B,T,3,H,W)
     bboxes: torch.Tensor,  # (B,T,N,4) normalized
     person_mask: torch.Tensor,
     frame_mask: torch.Tensor,
     out_size: int,
-    roi_chunk: int = 1024,
-) -> torch.Tensor:
-    """ROI crop via grid_sample. Returns (B,T,N,3,out_size,out_size)."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """ROI crop via grid_sample for valid slots only.
 
-    B, T, _, H, W = frames.shape
-    _, _, N, _ = bboxes.shape
+    Returns:
+        valid_idx: (K,3) [b,t,n]
+        valid_crops: (K,3,out_size,out_size)
+    """
+
     device = frames.device
-
     valid = person_mask & frame_mask.unsqueeze(-1)  # (B,T,N)
-    crops = frames.new_zeros((B, T, N, 3, out_size, out_size))
     valid_idx = valid.nonzero(as_tuple=False)  # (K,3)
     if valid_idx.numel() == 0:
-        return crops
+        return valid_idx, frames.new_zeros((0, 3, out_size, out_size))
 
     # Keep grid computations in the same dtype as frames to avoid AMP dtype mismatch.
     u = torch.linspace(0, 1, out_size, device=device, dtype=frames.dtype)
@@ -44,9 +44,6 @@ def roi_crop_batch(
     grid_y, grid_x = torch.meshgrid(v, u, indexing="ij")
     base = torch.stack([grid_x, grid_y], dim=-1)  # (S,S,2)
 
-    chunk = max(1, int(roi_chunk))
-
-    # Flatten index for easier slicing.
     b = valid_idx[:, 0]
     t = valid_idx[:, 1]
     n = valid_idx[:, 2]
@@ -56,22 +53,17 @@ def roi_crop_batch(
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     w = (x2 - x1).clamp(min=1e-6)
     h = (y2 - y1).clamp(min=1e-6)
-
-    for s in range(0, int(valid_idx.shape[0]), chunk):
-        e = min(int(valid_idx.shape[0]), s + chunk)
-        gx = x1[s:e, None, None] + base[None, :, :, 0] * w[s:e, None, None]
-        gy = y1[s:e, None, None] + base[None, :, :, 1] * h[s:e, None, None]
-        grid = torch.stack([gx * 2 - 1, gy * 2 - 1], dim=-1)  # (C,S,S,2)
-        crop_chunk = F.grid_sample(
-            frames_sel[s:e],
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
-        crops[b[s:e], t[s:e], n[s:e]] = crop_chunk.to(dtype=crops.dtype)
-
-    return crops
+    gx = x1[:, None, None] + base[None, :, :, 0] * w[:, None, None]
+    gy = y1[:, None, None] + base[None, :, :, 1] * h[:, None, None]
+    grid = torch.stack([gx * 2 - 1, gy * 2 - 1], dim=-1)  # (K,S,S,2)
+    crops = F.grid_sample(
+        frames_sel,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return valid_idx, crops
 
 
 class TemporalEncoder(nn.Module):
@@ -226,25 +218,23 @@ class ImportanceRanker(nn.Module):
         pm = person_mask & fm.unsqueeze(-1)
 
         roi_chunk = int(getattr(self.config.training, "roi_chunk", 256))
-        crops = roi_crop_batch(
+        vis_feats = frames.new_zeros((B, T, N, int(self.config.model.features.dino.feature_dim)))
+        valid_idx, crops_valid = roi_crop_valid_batch(
             frames,
             bboxes,
             pm,
             fm,
             out_size=int(self.config.model.features.dino.image_size),
-            roi_chunk=roi_chunk,
         )
-        valid_idx = pm.nonzero(as_tuple=False)  # (K,3) => b,t,n
-
-        vis_feats = crops.new_zeros((B, T, N, int(self.config.model.features.dino.feature_dim)))
         if valid_idx.numel() > 0:
-            crops_valid = crops[valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2]]  # (K,3,S,S)
             chunk = roi_chunk
-            outs = []
+            b_idx = valid_idx[:, 0]
+            t_idx = valid_idx[:, 1]
+            n_idx = valid_idx[:, 2]
             for s in range(0, int(crops_valid.shape[0]), chunk):
-                outs.append(self.vision(crops_valid[s : s + chunk]))
-            vis_valid = torch.cat(outs, dim=0)
-            vis_feats[valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2]] = vis_valid.to(dtype=vis_feats.dtype)
+                e = min(int(crops_valid.shape[0]), s + chunk)
+                vis_chunk = self.vision(crops_valid[s:e])
+                vis_feats[b_idx[s:e], t_idx[s:e], n_idx[s:e]] = vis_chunk.to(dtype=vis_feats.dtype)
 
         geom_feats = self.geom(bboxes, pm)
 

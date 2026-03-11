@@ -189,8 +189,6 @@ class MemoryEfficientTrainer:
         train_pref_losses = []
         val_imp_losses = []
         val_pref_losses = []
-        train_cf_losses = []
-        val_cf_losses = []
 
         num_epochs = int(self.config.training.num_epochs)
         early_stop_patience = getattr(self.config.training, "early_stop", None)
@@ -208,8 +206,8 @@ class MemoryEfficientTrainer:
                 train_sampler.set_epoch(epoch)
 
             t_epoch0 = time.perf_counter() if self._is_main_process() else 0.0
-            train_loss, train_acc, train_imp_loss, train_pref_loss, train_cf_loss = train_epoch(self, log_every=10)
-            val_loss, val_acc, r1, r2, r3, val_imp_loss, val_pref_loss, val_cf_loss = validate_epoch(self, log_every=10)
+            train_loss, train_acc, train_imp_loss, train_pref_loss = train_epoch(self, log_every=10)
+            val_loss, val_acc, r1, r2, r3, val_imp_loss, val_pref_loss = validate_epoch(self, log_every=10)
             t_epoch1 = time.perf_counter() if self._is_main_process() else 0.0
 
             train_losses.append(train_loss)
@@ -224,8 +222,6 @@ class MemoryEfficientTrainer:
             train_pref_losses.append(train_pref_loss)
             val_imp_losses.append(val_imp_loss)
             val_pref_losses.append(val_pref_loss)
-            train_cf_losses.append(train_cf_loss)
-            val_cf_losses.append(val_cf_loss)
 
             if self.record_logger and self._is_main_process():
                 self.record_logger.log_losses(
@@ -234,11 +230,9 @@ class MemoryEfficientTrainer:
                         "train_loss": train_loss,
                         "train_importance_loss": train_imp_loss,
                         "train_preference_loss": train_pref_loss,
-                        "train_cf_influence_loss": train_cf_loss,
                         "val_loss": val_loss,
                         "val_importance_loss": val_imp_loss,
                         "val_preference_loss": val_pref_loss,
-                        "val_cf_influence_loss": val_cf_loss,
                         "train_acc": train_acc,
                         "val_acc": val_acc,
                         "rank@1": r1,
@@ -305,20 +299,18 @@ class MemoryEfficientTrainer:
                 improved = current_val_acc > best_val_acc
 
                 logger.info(
-                    "Epoch %d: train_acc=%.4f train_loss=%.4f (imp=%.4f pref=%.4f cf=%.4f) "
-                    "val_acc=%.4f val_loss=%.4f (imp=%.4f pref=%.4f cf=%.4f) "
+                    "Epoch %d: train_acc=%.4f train_loss=%.4f (imp=%.4f pref=%.4f) "
+                    "val_acc=%.4f val_loss=%.4f (imp=%.4f pref=%.4f) "
                     "rank1=%.2f%% rank2=%.2f%% rank3=%.2f%% lr=%.6f group_lrs=[%s] dt=%.1fs",
                     int(epoch),
                     float(train_acc),
                     float(train_loss),
                     float(train_imp_loss),
                     float(train_pref_loss),
-                    float(train_cf_loss),
                     float(val_acc),
                     float(val_loss),
                     float(val_imp_loss),
                     float(val_pref_loss),
-                    float(val_cf_loss),
                     float(r1),
                     float(r2),
                     float(r3),
