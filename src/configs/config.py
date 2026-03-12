@@ -16,7 +16,7 @@ from typing import Optional
 class DataConfig:
     data_dir: str = "data/shared_data/preprocessed_fixed"
     video_length: int = 120
-    max_persons: int = 20
+    max_persons: int = 16
     image_height: int = 192
     image_width: int = 336
     cache_data: bool = False
