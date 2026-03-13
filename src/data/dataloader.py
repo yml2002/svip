@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ class MSGVIPDataset(Dataset):
         **kwargs,
     ) -> None:
         # Contract: runtime always passes an ExperimentConfig with .data present.
+        self.local_rank = int(getattr(getattr(config, "training", object()), "local_rank", 0))
         self.config = config.data
 
         self.data_path = Path(data_path) if data_path is not None else Path(self.config.data_dir)
@@ -48,8 +49,43 @@ class MSGVIPDataset(Dataset):
 
         self.file_list = self._load_file_list()
         self.data_cache = {} if self.cache_data else None
+        self._resample_log_emitted = False
 
         logger.info("Loaded %d samples from %s split", len(self.file_list), self.split)
+
+    def _resample_temporal_arrays(
+        self,
+        *,
+        frames: np.ndarray,
+        bboxes: np.ndarray,
+        person_ids: np.ndarray,
+        person_mask: np.ndarray,
+        frame_mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Resample all time-aligned arrays to config.video_length.
+
+        Uses deterministic uniform indexing. If source length is shorter than
+        target length, indices are repeated (upsampling by repetition).
+        """
+        src_t = int(frames.shape[0])
+        tgt_t = int(self.num_frames)
+        if src_t <= 0:
+            raise ValueError(f"Invalid temporal length: {src_t}")
+        if tgt_t <= 0:
+            raise ValueError(f"config.video_length must be > 0, got {tgt_t}")
+        if src_t == tgt_t:
+            return frames, bboxes, person_ids, person_mask, frame_mask
+
+        idx = np.linspace(0, src_t - 1, num=tgt_t, dtype=np.float64)
+        idx = np.clip(np.rint(idx).astype(np.int64), 0, src_t - 1)
+
+        return (
+            frames[idx],
+            bboxes[idx],
+            person_ids[idx],
+            person_mask[idx],
+            frame_mask[idx],
+        )
 
     def _load_file_list(self) -> List[str]:
         split_path = self.data_path / self.split
@@ -105,6 +141,28 @@ class MSGVIPDataset(Dataset):
             scene_category = data["scene_category"].item() if hasattr(data["scene_category"], "item") else str(data["scene_category"])
         except KeyError as e:
             raise ValueError(f"Missing field in {file_path}: {e}")
+
+        if int(frames.shape[0]) != int(self.num_frames):
+            src_t = int(frames.shape[0])
+            frames, bboxes, person_ids, person_mask, frame_mask = self._resample_temporal_arrays(
+                frames=frames,
+                bboxes=bboxes,
+                person_ids=person_ids,
+                person_mask=person_mask,
+                frame_mask=frame_mask,
+            )
+            worker = get_worker_info()
+            is_worker0 = worker is None or int(worker.id) == 0
+            is_rank0 = int(self.local_rank) == 0
+            if not self._resample_log_emitted and self.split == "train" and is_rank0 and is_worker0:
+                logger.info(
+                    "Temporal resampling enabled for split=%s: source_T=%d -> target_T=%d",
+                    self.split,
+                    src_t,
+                    int(self.num_frames),
+                )
+                self._resample_log_emitted = True
+
         slots = int(self.num_person_slots)
         T, n_in = int(bboxes.shape[0]), int(bboxes.shape[1])
         target_index_int = int(target_index)

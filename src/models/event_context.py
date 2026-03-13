@@ -29,7 +29,7 @@ class TemporalEncoder(nn.Module):
             dropout=dropout,
             batch_first=True,
             activation="gelu",
-            norm_first=True,
+            norm_first=False,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 

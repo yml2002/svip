@@ -275,16 +275,17 @@ class MemoryEfficientTrainer:
                 )
 
                 # Always save latest.
-                self.save_checkpoint_with_metrics(
-                    name="last.pt",
-                    train_loss=float(train_loss),
-                    train_acc=float(train_acc),
-                    val_loss=float(val_loss),
-                    val_acc=float(val_acc),
-                    rank1=float(r1),
-                    rank2=float(r2),
-                    rank3=float(r3),
-                )
+                if bool(getattr(self.config.training, "save_checkpoints", True)):
+                    self.save_checkpoint_with_metrics(
+                        name="last.pt",
+                        train_loss=float(train_loss),
+                        train_acc=float(train_acc),
+                        val_loss=float(val_loss),
+                        val_acc=float(val_acc),
+                        rank1=float(r1),
+                        rank2=float(r2),
+                        rank3=float(r3),
+                    )
 
             # Scheduler must advance on every rank under DDP.
             if self.scheduler is not None:
@@ -340,17 +341,18 @@ class MemoryEfficientTrainer:
                 if improved:
                     best_val_acc = current_val_acc
                     best_epoch = int(epoch)
-                    self.save_checkpoint_with_metrics(
-                        name="best.pt",
-                        train_loss=float(train_loss),
-                        train_acc=float(train_acc),
-                        val_loss=float(val_loss),
-                        val_acc=float(val_acc),
-                        rank1=float(r1),
-                        rank2=float(r2),
-                        rank3=float(r3),
-                    )
-                    logger.info("Updated best checkpoint: best.pt (epoch=%d best_val_acc=%.4f)", int(epoch), float(val_acc))
+                    if bool(getattr(self.config.training, "save_checkpoints", True)):
+                        self.save_checkpoint_with_metrics(
+                            name="best.pt",
+                            train_loss=float(train_loss),
+                            train_acc=float(train_acc),
+                            val_loss=float(val_loss),
+                            val_acc=float(val_acc),
+                            rank1=float(r1),
+                            rank2=float(r2),
+                            rank3=float(r3),
+                        )
+                        logger.info("Updated best checkpoint: best.pt (epoch=%d best_val_acc=%.4f)", int(epoch), float(val_acc))
 
                 # Early stopping decision happens after validation, records, plots,
                 # checkpoint, and scheduler step have all completed for this epoch.

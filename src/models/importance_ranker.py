@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from src.models.bbox_geom import BBoxGeomEncoder
 from src.models.event_context import EventTokenContext
@@ -89,7 +90,7 @@ class TemporalEncoder(nn.Module):
             dropout=dropout,
             batch_first=True,
             activation="gelu",
-            norm_first=True,
+            norm_first=False,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
@@ -201,7 +202,14 @@ class ImportanceRanker(nn.Module):
             nn.Linear(int(sc_cfg.hidden_dim), 1),
         )
 
+        self.activation_checkpointing = bool(getattr(config.training, "activation_checkpointing", True))
+
         logger.info("Initialized ImportanceRanker (vision_dir=%s)", str(dino_cfg.model_dir))
+
+    def _maybe_checkpoint(self, fn, *args):
+        if self.training and self.activation_checkpointing:
+            return torch_checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
 
     def forward(
         self,
@@ -245,25 +253,27 @@ class ImportanceRanker(nn.Module):
         # Transformer 的时间 mask 是“该 person 在该帧是否有效”
         pm_bt = pm.permute(0, 2, 1).reshape(B * N, T)
 
-        rel_tokens = self.temporal_encoder(
+        rel_tokens = self._maybe_checkpoint(
+            self.temporal_encoder,
             self.to_dmodel(social).permute(0, 2, 1, 3).reshape(B * N, T, -1),
             pm_bt,
         ).reshape(B, N, T, -1).permute(0, 2, 1, 3)  # (B,T,N,D)
 
         if self.use_event_token:
-            rel_tokens = self.event_ctx(rel_tokens, pm).masked_fill(~pm.unsqueeze(-1), 0.0)
+            rel_tokens = self._maybe_checkpoint(self.event_ctx, rel_tokens, pm).masked_fill(~pm.unsqueeze(-1), 0.0)
 
-        rel_pooled = self.temporal_agg(rel_tokens, pm)  # (B,N,D)
+        rel_pooled = self._maybe_checkpoint(self.temporal_agg, rel_tokens, pm)  # (B,N,D)
 
         valid_mask = pm.any(dim=1)
 
         if self.dual_head:
-            self_tokens = self.temporal_encoder(
+            self_tokens = self._maybe_checkpoint(
+                self.temporal_encoder,
                 self.self_to_dmodel(fused).permute(0, 2, 1, 3).reshape(B * N, T, -1),
                 pm_bt,
             ).reshape(B, N, T, -1).permute(0, 2, 1, 3)
 
-            self_pooled = self.temporal_agg(self_tokens, pm)
+            self_pooled = self._maybe_checkpoint(self.temporal_agg, self_tokens, pm)
             self_logits = self.self_scoring(self_pooled).squeeze(-1)
             rel_logits = self.scoring(rel_pooled).squeeze(-1)
             gate = torch.sigmoid(self.gate_mlp(torch.cat([self_pooled, rel_pooled], dim=-1)).squeeze(-1))

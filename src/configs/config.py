@@ -16,6 +16,7 @@ from typing import Optional
 class DataConfig:
     data_dir: str = "data/shared_data/preprocessed_fixed"
     video_length: int = 120
+    # video_length: int = 96
     max_persons: int = 16
     image_height: int = 192
     image_width: int = 336
@@ -121,6 +122,7 @@ class TrainingConfig:
     gate_hidden_dim: int = 128
 
     use_mixed_precision: bool = True
+    activation_checkpointing: bool = True
     max_grad_norm: float = 3.0
 
     distributed: bool = False
@@ -130,6 +132,7 @@ class TrainingConfig:
 
     num_workers: int = 4
     pin_memory: bool = True
+    save_checkpoints: bool = False
 
     early_stop: Optional[int] = 3
 
