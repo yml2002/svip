@@ -142,6 +142,9 @@ def parse_args(argv=None):
 
     parser.add_argument("--importance_weight", type=float, default=None)
     parser.add_argument("--preference_weight", type=float, default=None)
+    parser.add_argument("--rel_branch_weight", type=float, default=None)
+    parser.add_argument("--counterfactual_branch_weight", type=float, default=None)
+    parser.add_argument("--moe_entropy_weight", type=float, default=None)
     parser.add_argument("--logit_temperature", type=float, default=None)
     parser.add_argument("--swap_splits", action="store_true")
     parser.add_argument("--swap_fraction", type=float, default=0.5)

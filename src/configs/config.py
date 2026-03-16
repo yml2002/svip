@@ -89,10 +89,60 @@ class ScoringConfig:
 
 
 @dataclass
+class RelationConfig:
+    enabled: bool = True
+    hidden_dim: int = 256
+    num_experts: int = 4
+    topk_experts: int = 2
+    dispatch_mode: str = "dense"
+    router_temperature: float = 1.0
+    router_noise_std: float = 0.0
+    capacity_factor: float = 1.25
+    drop_tokens: bool = False
+    dropout: float = 0.1
+
+
+@dataclass
+class CounterfactualConfig:
+    enabled: bool = True
+    hidden_dim: int = 256
+    num_experts: int = 4
+    topk_experts: int = 2
+    dispatch_mode: str = "dense"
+    router_temperature: float = 1.0
+    router_noise_std: float = 0.0
+    capacity_factor: float = 1.25
+    drop_tokens: bool = False
+    dropout: float = 0.1
+
+
+@dataclass
+class FusionConfig:
+    mode: str = "moe_residual"
+    hidden_dim: int = 128
+    topk_branches: int = 2
+    router_temperature: float = 1.0
+    aux_residual_scale: float = 0.75
+    dropout: float = 0.1
+    self_hard_conf_threshold: float = 0.72
+    self_hard_margin_threshold: float = 1.0
+    hard_temperature: float = 0.12
+    branch_conf_threshold: float = 0.56
+    branch_margin_threshold: float = 0.25
+    use_branch_rejection: bool = True
+    delta_logit_scale: float = 1.0
+
+
+@dataclass
 class LossConfig:
     beta: float = 1.0
     importance_weight: float = 1.0
     preference_weight: float = 0.3
+    rel_branch_weight: float = 0.30
+    counterfactual_branch_weight: float = 0.30
+    moe_entropy_weight: float = 0.01
+    moe_load_balance_weight: float = 0.0
+    moe_router_z_weight: float = 0.0
 
 
 @dataclass
@@ -102,6 +152,9 @@ class ModelConfig:
     gatv2: GATv2Config = field(default_factory=GATv2Config)
     temporal: TemporalTransformerConfig = field(default_factory=TemporalTransformerConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
+    relation: RelationConfig = field(default_factory=RelationConfig)
+    counterfactual: CounterfactualConfig = field(default_factory=CounterfactualConfig)
+    fusion: FusionConfig = field(default_factory=FusionConfig)
     loss: LossConfig = field(default_factory=LossConfig)
 
 

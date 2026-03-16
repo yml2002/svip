@@ -156,6 +156,7 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
                 importance_logits=outputs["importance_logits"],
                 target_index=batch["target_index"],
                 person_mask=batch["person_mask"],
+                model_outputs=outputs,
             )
             loss = loss_components["total_loss"] / trainer.accumulation_steps
 
@@ -333,6 +334,7 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
                 importance_logits=outputs["importance_logits"],
                 target_index=batch["target_index"],
                 person_mask=batch["person_mask"],
+                model_outputs=outputs,
             )
 
         loss_value = float(loss_components["total_loss"].item())
