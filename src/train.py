@@ -16,6 +16,7 @@ Usage:
 import argparse
 import logging
 import os
+import random
 import signal
 import sys
 import warnings
@@ -23,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 import faulthandler
+import numpy as np
 import torch
 
 
@@ -98,6 +100,17 @@ def create_output_structure(base_dir: str) -> dict:
     return paths
 
 
+def set_global_seed(seed: int) -> None:
+    """Set global RNG state for reproducible ablations."""
+    s = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(s)
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+
+
 def parse_args(argv=None):
     base_config = get_default_config()
 
@@ -142,14 +155,15 @@ def parse_args(argv=None):
 
     parser.add_argument("--importance_weight", type=float, default=None)
     parser.add_argument("--preference_weight", type=float, default=None)
+    parser.add_argument("--self_branch_weight", type=float, default=None)
     parser.add_argument("--rel_branch_weight", type=float, default=None)
-    parser.add_argument("--counterfactual_branch_weight", type=float, default=None)
-    parser.add_argument("--moe_entropy_weight", type=float, default=None)
+    parser.add_argument("--counterfactual_effect_weight", type=float, default=None)
+    parser.add_argument("--counterfactual_margin", type=float, default=None)
     parser.add_argument("--logit_temperature", type=float, default=None)
     parser.add_argument("--swap_splits", action="store_true")
     parser.add_argument("--swap_fraction", type=float, default=0.5)
 
-    parser.add_argument("--run_tag", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=3407)
 
     args = parser.parse_args(argv)
     setattr(args, "_config_data_dir", str(base_config.data.data_dir))
@@ -201,6 +215,7 @@ def main() -> int:
         torch.distributed.init_process_group(backend="nccl")
 
     args = parse_args()
+    set_global_seed(args.seed)
     raw_data_dir_arg = args.data_dir
     args.data_dir = resolve_data_path(args.data_dir)
     config_default_dir = getattr(args, "_config_data_dir", raw_data_dir_arg)

@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from src.models.bbox_geom import BBoxGeomEncoder
-from src.models.counterfactual_reasoner import CounterfactualMoEReasoner, RelationMoEReasoner
+from src.models.counterfactual_reasoner import CounterfactualReasoner, RelationReasoner
 from src.models.event_context import EventTokenContext
 from src.models.vision_encoder import VisionEncoder
 from src.models.gatv2 import GATv2Stack
@@ -116,8 +116,6 @@ class ImportanceRanker(nn.Module):
         fusion_cfg = config.model.fusion
         self.use_relation_branch = bool(getattr(rel_cfg, "enabled", True))
         self.use_counterfactual_branch = bool(getattr(cf_cfg, "enabled", True))
-        self.relation_dispatch_mode = str(getattr(rel_cfg, "dispatch_mode", "dense")).strip().lower()
-        self.counterfactual_dispatch_mode = str(getattr(cf_cfg, "dispatch_mode", "dense")).strip().lower()
 
         if not bool(dino_cfg.enabled):
             raise ValueError("Vision backbone is disabled. Set config.model.features.dino.enabled=True")
@@ -185,71 +183,75 @@ class ImportanceRanker(nn.Module):
             )
 
         self.to_dmodel = nn.Linear(int(gat_cfg.hidden_dim), int(tmp_cfg.d_model))
-        if not self.use_relation_branch:
-            self.rel_scoring = nn.Sequential(
-                nn.Linear(agg_out_dim, int(sc_cfg.hidden_dim)),
-                nn.ReLU(inplace=True),
-                nn.Dropout(float(config.model.dropout.scoring)),
-                nn.Linear(int(sc_cfg.hidden_dim), 1),
-            )
-        else:
-            self.rel_scoring = None
 
+        # Keep self branch independent from graph-enhanced relation features.
         self.dual_head = bool(getattr(config.training, "enable_dual_head", False))
-        if self.dual_head:
-            self.self_to_dmodel = nn.Linear(int(feat_cfg.fused_dim), int(tmp_cfg.d_model))
-            self.self_scoring = nn.Sequential(
-                nn.Linear(int(tmp_cfg.agg_out_dim), int(sc_cfg.hidden_dim)),
-                nn.ReLU(inplace=True),
-                nn.Dropout(float(config.model.dropout.scoring)),
-                nn.Linear(int(sc_cfg.hidden_dim), 1),
+        if not self.dual_head:
+            raise ValueError("config.training.enable_dual_head must be True to keep self/rel paths disentangled")
+        self.self_temporal_attn = nn.Sequential(
+            nn.LayerNorm(int(feat_cfg.fused_dim)),
+            nn.Linear(int(feat_cfg.fused_dim), 1),
+        )
+        self.self_scoring = nn.Sequential(
+            nn.Linear(int(feat_cfg.fused_dim), int(sc_cfg.hidden_dim)),
+            nn.ReLU(inplace=True),
+            nn.Dropout(float(config.model.dropout.scoring)),
+            nn.Linear(int(sc_cfg.hidden_dim), 1),
+        )
+
+        fusion_dim = int(getattr(fusion_cfg, "feature_dim", int(agg_out_dim)))
+        if fusion_dim <= 0:
+            raise ValueError(f"fusion.feature_dim must be > 0, got {fusion_dim}")
+
+        self.self_feature_proj = nn.Linear(int(feat_cfg.fused_dim), fusion_dim)
+        self.rel_feature_proj = nn.Linear(int(agg_out_dim), fusion_dim)
+        self.cf_feature_proj = nn.Linear(int(agg_out_dim), fusion_dim)
+
+        fusion_heads = int(getattr(fusion_cfg, "interaction_heads", 8))
+        if fusion_dim % max(1, fusion_heads) != 0:
+            raise ValueError(
+                f"fusion.feature_dim ({fusion_dim}) must be divisible by fusion.interaction_heads ({fusion_heads})"
             )
+        fusion_layers = max(1, int(getattr(fusion_cfg, "interaction_layers", 1)))
+        fusion_dropout = float(getattr(fusion_cfg, "dropout", 0.1))
+
+        fusion_layer = nn.TransformerEncoderLayer(
+            d_model=fusion_dim,
+            nhead=fusion_heads,
+            dim_feedforward=max(2 * fusion_dim, 512),
+            dropout=fusion_dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=False,
+        )
+        self.feature_interaction = nn.TransformerEncoder(fusion_layer, num_layers=fusion_layers)
+        self.feature_pool = nn.Linear(fusion_dim, 1)
+        self.final_scoring = nn.Sequential(
+            nn.Linear(fusion_dim, int(sc_cfg.hidden_dim)),
+            nn.ReLU(inplace=True),
+            nn.Dropout(float(config.model.dropout.scoring)),
+            nn.Linear(int(sc_cfg.hidden_dim), 1),
+        )
 
         if self.use_relation_branch:
-            self.relation_reasoner = RelationMoEReasoner(
+            self.relation_reasoner = RelationReasoner(
                 token_dim=int(tmp_cfg.d_model),
                 out_dim=agg_out_dim,
                 hidden_dim=int(rel_cfg.hidden_dim),
-                num_experts=int(rel_cfg.num_experts),
-                topk_experts=int(rel_cfg.topk_experts),
-                dispatch_mode=self.relation_dispatch_mode,
-                router_temperature=float(rel_cfg.router_temperature),
-                router_noise_std=float(getattr(rel_cfg, "router_noise_std", 0.0)),
-                capacity_factor=float(getattr(rel_cfg, "capacity_factor", 1.25)),
-                drop_tokens=bool(getattr(rel_cfg, "drop_tokens", True)),
                 dropout=float(rel_cfg.dropout),
             )
 
         if self.use_counterfactual_branch:
-            self.counterfactual_reasoner = CounterfactualMoEReasoner(
+            self.counterfactual_reasoner = CounterfactualReasoner(
                 token_dim=int(tmp_cfg.d_model),
                 out_dim=agg_out_dim,
                 hidden_dim=int(cf_cfg.hidden_dim),
-                num_experts=int(cf_cfg.num_experts),
-                topk_experts=int(cf_cfg.topk_experts),
-                dispatch_mode=self.counterfactual_dispatch_mode,
-                router_temperature=float(cf_cfg.router_temperature),
-                router_noise_std=float(getattr(cf_cfg, "router_noise_std", 0.0)),
-                capacity_factor=float(getattr(cf_cfg, "capacity_factor", 1.25)),
-                drop_tokens=bool(getattr(cf_cfg, "drop_tokens", True)),
                 dropout=float(cf_cfg.dropout),
             )
 
-        self.fusion_mode = str(getattr(fusion_cfg, "mode", "moe_residual"))
-        self.aux_residual_scale = float(getattr(fusion_cfg, "aux_residual_scale", 0.75))
-        self.self_hard_conf_threshold = float(getattr(fusion_cfg, "self_hard_conf_threshold", 0.72))
-        self.self_hard_margin_threshold = float(getattr(fusion_cfg, "self_hard_margin_threshold", 1.0))
-        self.hard_temperature = float(getattr(fusion_cfg, "hard_temperature", 0.12))
-        self.branch_conf_threshold = float(getattr(fusion_cfg, "branch_conf_threshold", 0.56))
-        self.branch_margin_threshold = float(getattr(fusion_cfg, "branch_margin_threshold", 0.25))
-        self.use_branch_rejection = bool(getattr(fusion_cfg, "use_branch_rejection", True))
-        self.delta_logit_scale = float(getattr(fusion_cfg, "delta_logit_scale", 1.0))
-
-        self.branch_names = []
-        if self.dual_head:
-            self.branch_names.append("self")
-        # Relation branch is always present (either MoE reasoner or simple scorer fallback).
-        self.branch_names.append("rel")
+        self.branch_names = ["self"]
+        if self.use_relation_branch:
+            self.branch_names.append("rel")
         if self.use_counterfactual_branch:
             self.branch_names.append("counterfactual")
 
@@ -263,44 +265,11 @@ class ImportanceRanker(nn.Module):
         return fn(*args)
 
     @staticmethod
-    def _calibrate_branch_logits(logits: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-        mask_f = valid_mask.to(dtype=logits.dtype)
-        denom = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)
-        mean = (logits * mask_f).sum(dim=1, keepdim=True) / denom
-        centered = (logits - mean) * mask_f
-        var = (centered * centered).sum(dim=1, keepdim=True) / denom
-        std = torch.sqrt(var + 1e-6)
-        return centered / std.clamp(min=1e-3)
-
-    @staticmethod
-    def _branch_conf_margin(logits: torch.Tensor, valid_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        masked = logits.masked_fill(~valid_mask, -1e4)
-        probs = torch.softmax(masked, dim=1)
-        conf = probs.max(dim=1).values
-        topk = masked.topk(k=min(2, int(masked.shape[1])), dim=1).values
-        if int(topk.shape[1]) < 2:
-            margin = conf.new_zeros(conf.shape)
-        else:
-            margin = topk[:, 0] - topk[:, 1]
-        return conf, margin
-
-    def _hard_case_ratio(self, base_logits: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-        conf, margin = self._branch_conf_margin(base_logits, valid_mask)
-        hard_by_conf = torch.sigmoid(
-            (self.self_hard_conf_threshold - conf) / max(self.hard_temperature, 1e-6)
-        )
-        hard_by_margin = torch.sigmoid(
-            (self.self_hard_margin_threshold - margin) / max(self.hard_temperature, 1e-6)
-        )
-        return 0.5 * (hard_by_conf + hard_by_margin)
-
-    def _branch_trust(self, branch_logits: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-        conf, margin = self._branch_conf_margin(branch_logits, valid_mask)
-        if not self.use_branch_rejection:
-            return torch.ones_like(conf)
-        conf_ok = conf >= self.branch_conf_threshold
-        margin_ok = margin >= self.branch_margin_threshold
-        return (conf_ok & margin_ok).to(dtype=branch_logits.dtype)
+    def _masked_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
+        masked = logits.masked_fill(~mask, -1e4)
+        weights = torch.softmax(masked, dim=dim)
+        weights = weights * mask.to(dtype=weights.dtype)
+        return weights / weights.sum(dim=dim, keepdim=True).clamp(min=1e-6)
 
     def forward(
         self,
@@ -357,151 +326,81 @@ class ImportanceRanker(nn.Module):
 
         valid_mask = pm.any(dim=1)
 
-        relation_router_entropy = rel_pooled.new_tensor(0.0)
-        counterfactual_router_entropy = rel_pooled.new_tensor(0.0)
-        relation_load_balance_loss = rel_pooled.new_tensor(0.0)
-        counterfactual_load_balance_loss = rel_pooled.new_tensor(0.0)
-        relation_router_z_loss = rel_pooled.new_tensor(0.0)
-        counterfactual_router_z_loss = rel_pooled.new_tensor(0.0)
-        fusion_router_entropy = rel_pooled.new_tensor(0.0)
-
         if self.use_relation_branch:
-            if self.relation_dispatch_mode == "sparse":
-                relation_out = self.relation_reasoner(rel_tokens, pm)
-            else:
-                relation_out = self._maybe_checkpoint(self.relation_reasoner, rel_tokens, pm)
+            relation_out = self.relation_reasoner(rel_tokens, pm)
             rel_features = rel_pooled + relation_out["relation_features"]
             rel_logits = relation_out["relation_logits"]
-            relation_router_entropy = relation_out["relation_router_entropy"]
-            relation_load_balance_loss = relation_out["relation_load_balance_loss"]
-            relation_router_z_loss = relation_out["relation_router_z_loss"]
         else:
             relation_out = None
             rel_features = rel_pooled
-            rel_logits = self.rel_scoring(rel_features).squeeze(-1) if self.rel_scoring is not None else rel_pooled.new_zeros((B, N))
+            rel_logits = rel_pooled.new_zeros((B, N))
 
-        if self.dual_head:
-            self_tokens = self._maybe_checkpoint(
-                self.temporal_encoder,
-                self.self_to_dmodel(fused).permute(0, 2, 1, 3).reshape(B * N, T, -1),
-                pm_bt,
-            ).reshape(B, N, T, -1).permute(0, 2, 1, 3)
-
-            self_pooled = self._maybe_checkpoint(self.temporal_agg, self_tokens, pm)
-            self_logits = self.self_scoring(self_pooled).squeeze(-1)
-        else:
-            self_logits = None
+        self_attn_logits = self.self_temporal_attn(fused).squeeze(-1)
+        self_attn = self._masked_softmax(self_attn_logits, pm, dim=1)
+        self_pooled = (fused * self_attn.unsqueeze(-1)).sum(dim=1)
+        self_logits = self.self_scoring(self_pooled).squeeze(-1)
+        self_logits = self_logits.masked_fill(~valid_mask, -1e4)
 
         if self.use_counterfactual_branch:
-            if self.counterfactual_dispatch_mode == "sparse":
-                cf_out = self.counterfactual_reasoner(rel_tokens, pm)
-            else:
-                cf_out = self._maybe_checkpoint(self.counterfactual_reasoner, rel_tokens, pm)
+            cf_out = self.counterfactual_reasoner(rel_tokens, pm)
             counterfactual_logits = cf_out["counterfactual_logits"]
             counterfactual_delta = cf_out["counterfactual_delta"]
             event_state = cf_out["event_state"]
-            counterfactual_router_entropy = cf_out["counterfactual_router_entropy"]
-            counterfactual_load_balance_loss = cf_out["counterfactual_load_balance_loss"]
-            counterfactual_router_z_loss = cf_out["counterfactual_router_z_loss"]
         else:
             cf_out = None
             counterfactual_logits = None
             counterfactual_delta = None
             event_state = None
 
-        rel_delta_logits = self.delta_logit_scale * torch.tanh(
-            self._calibrate_branch_logits(rel_logits, valid_mask)
-        )
-        rel_branch_logits = rel_delta_logits
-        rel_weight = rel_delta_logits.new_zeros((B,))
+        branch_features = [self.self_feature_proj(self_pooled)]
+        branch_names = ["self"]
 
-        if self.dual_head:
-            base_logits = self_logits
-        else:
-            base_logits = rel_delta_logits
+        if self.use_relation_branch:
+            branch_features.append(self.rel_feature_proj(rel_features))
+            branch_names.append("rel")
 
-        hard_ratio = self._hard_case_ratio(base_logits, valid_mask)
+        if self.use_counterfactual_branch and cf_out is not None:
+            branch_features.append(self.cf_feature_proj(cf_out["counterfactual_features"]))
+            branch_names.append("counterfactual")
 
-        if self.dual_head:
-            rel_branch_logits = base_logits + rel_delta_logits
-            rel_trust = self._branch_trust(rel_branch_logits, valid_mask)
-            rel_score = hard_ratio * rel_trust
-            rel_weight = rel_score
-        else:
-            rel_trust = rel_delta_logits.new_ones((B,))
+        branch_stack = torch.stack(branch_features, dim=2)  # (B,N,M,D)
+        branch_mask = valid_mask.unsqueeze(-1).unsqueeze(-1).to(dtype=branch_stack.dtype)
+        branch_stack = branch_stack * branch_mask
 
-        cf_delta_logits = None
-        cf_branch_logits = None
-        cf_weight = rel_weight.new_zeros((B,))
-        if counterfactual_logits is not None:
-            cf_delta_logits = self.delta_logit_scale * torch.tanh(
-                self._calibrate_branch_logits(counterfactual_logits, valid_mask)
-            )
-            if self.dual_head:
-                cf_branch_logits = base_logits + cf_delta_logits
-            else:
-                cf_branch_logits = cf_delta_logits
-            cf_trust = self._branch_trust(cf_branch_logits, valid_mask)
-            cf_score = hard_ratio * cf_trust
-            cf_weight = cf_score
+        M = int(branch_stack.shape[2])
+        D = int(branch_stack.shape[3])
+        branch_tokens = branch_stack.reshape(B * N, M, D)
+        branch_tokens = self.feature_interaction(branch_tokens)
 
-        score_sum = (rel_weight + cf_weight).clamp(min=1e-6)
-        rel_norm = rel_weight / score_sum
-        cf_norm = cf_weight / score_sum
+        pool_logits = self.feature_pool(branch_tokens).squeeze(-1)  # (B*N, M)
+        pool_weights = torch.softmax(pool_logits, dim=1)
+        fused_features = (branch_tokens * pool_weights.unsqueeze(-1)).sum(dim=1)
+        fused_features = fused_features.reshape(B, N, D)
 
-        if self.dual_head:
-            delta_mix = rel_norm.unsqueeze(1) * rel_delta_logits
-            if cf_delta_logits is not None:
-                delta_mix = delta_mix + cf_norm.unsqueeze(1) * cf_delta_logits
-            logits = base_logits + self.aux_residual_scale * hard_ratio.unsqueeze(1) * delta_mix
-            self_weight = (1.0 - hard_ratio).clamp(min=0.0, max=1.0)
-        else:
-            logits = rel_branch_logits
-            self_weight = rel_weight.new_zeros((B,))
-
-        rel_effective = hard_ratio * rel_norm
-        cf_effective = hard_ratio * cf_norm if counterfactual_logits is not None else rel_weight.new_zeros((B,))
-
-        weight_cols = []
-        if self.dual_head:
-            weight_cols.append(self_weight)
-        weight_cols.append(rel_effective)
-        if counterfactual_logits is not None:
-            weight_cols.append(cf_effective)
-        branch_weight_tensor = torch.stack(weight_cols, dim=1).unsqueeze(1).expand(-1, N, -1)
-
+        logits = self.final_scoring(fused_features).squeeze(-1)
         logits = logits.masked_fill(~valid_mask, -1e4)
+
+        branch_weight_tensor = pool_weights.reshape(B, N, M) * valid_mask.unsqueeze(-1).to(dtype=pool_weights.dtype)
+        branch_weight_tensor = branch_weight_tensor / branch_weight_tensor.sum(dim=-1, keepdim=True).clamp(min=1e-6)
 
         scores = torch.softmax(logits / float(self.config.model.scoring.temperature), dim=1) * valid_mask.float()
 
         out = {
             "importance_logits": logits,
             "importance_scores": scores,
-            "video_features": rel_features,
+            "video_features": fused_features,
             "branch_weights": branch_weight_tensor,
-            "branch_weight_names": list(self.branch_names[: branch_weight_tensor.shape[-1]]),
-            "fusion_router_entropy": fusion_router_entropy,
-            "relation_router_entropy": relation_router_entropy,
-            "counterfactual_router_entropy": counterfactual_router_entropy,
-            "relation_load_balance_loss": relation_load_balance_loss,
-            "counterfactual_load_balance_loss": counterfactual_load_balance_loss,
-            "relation_router_z_loss": relation_router_z_loss,
-            "counterfactual_router_z_loss": counterfactual_router_z_loss,
+            "branch_weight_names": branch_names,
         }
 
-        if self.dual_head:
-            out["importance_logits_self"] = self_logits
-        out["importance_logits_rel"] = rel_branch_logits
-        out["relation_delta_logits"] = rel_delta_logits
-        out["hard_case_ratio"] = hard_ratio
+        out["importance_logits_self"] = self_logits
+        out["self_attention"] = self_attn
+        out["importance_logits_rel"] = rel_logits
         out["relation_features"] = rel_features
         if relation_out is not None:
             out["relation_attention"] = relation_out["relation_attention"]
-            out["relation_router_probs"] = relation_out["relation_router_probs"]
         if cf_out is not None:
-            out["importance_logits_counterfactual"] = cf_branch_logits
-            out["counterfactual_delta_logits"] = cf_delta_logits
+            out["importance_logits_counterfactual"] = counterfactual_logits
             out["counterfactual_delta"] = counterfactual_delta
-            out["counterfactual_router_probs"] = cf_out["counterfactual_router_probs"]
             out["event_state"] = event_state
         return out

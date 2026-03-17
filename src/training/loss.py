@@ -95,32 +95,20 @@ class CombinedLoss(nn.Module):
 
         self.importance_weight = float(config.model.loss.importance_weight)
         self.preference_weight = float(config.model.loss.preference_weight)
+        self.self_branch_weight = float(getattr(config.model.loss, "self_branch_weight", 0.0))
         self.rel_branch_weight = float(getattr(config.model.loss, "rel_branch_weight", 0.0))
-        self.counterfactual_branch_weight = float(getattr(config.model.loss, "counterfactual_branch_weight", 0.0))
-        self.moe_entropy_weight = float(getattr(config.model.loss, "moe_entropy_weight", 0.0))
-        self.moe_load_balance_weight = float(getattr(config.model.loss, "moe_load_balance_weight", 0.0))
-        self.moe_router_z_weight = float(getattr(config.model.loss, "moe_router_z_weight", 0.0))
-
+        self.counterfactual_effect_weight = float(getattr(config.model.loss, "counterfactual_effect_weight", 0.0))
+        self.counterfactual_margin = float(getattr(config.model.loss, "counterfactual_margin", 0.0))
         logger.info(
-            "CombinedLoss: imp=%.3f pref=%.3f rel=%.3f cf=%.3f moe_entropy=%.3f moe_lb=%.3f moe_z=%.3f beta=%.3f",
+            "CombinedLoss: imp=%.3f pref=%.3f self=%.3f rel=%.3f cf_eff=%.3f cf_margin=%.3f beta=%.3f",
             self.importance_weight,
             self.preference_weight,
+            self.self_branch_weight,
             self.rel_branch_weight,
-            self.counterfactual_branch_weight,
-            self.moe_entropy_weight,
-            self.moe_load_balance_weight,
-            self.moe_router_z_weight,
+            self.counterfactual_effect_weight,
+            self.counterfactual_margin,
             beta_cfg,
         )
-
-    @staticmethod
-    def _safe_mean_from_outputs(model_outputs: Dict[str, torch.Tensor], key: str, ref: torch.Tensor) -> torch.Tensor:
-        val = model_outputs.get(key)
-        if val is None:
-            return ref.new_tensor(0.0)
-        if val.ndim == 0:
-            return val
-        return val.mean()
 
     def _weighted_importance(
         self,
@@ -142,19 +130,36 @@ class CombinedLoss(nn.Module):
         per_sample = self.preference_per_sample(logits, target_index, person_mask)
         return (per_sample * sample_weights).mean()
 
+    def _weighted_counterfactual_effect(
+        self,
+        counterfactual_delta: torch.Tensor,
+        target_index: torch.Tensor,
+        valid_mask: torch.Tensor,
+        sample_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        # Promote larger counterfactual event impact for the true target than negatives.
+        effect_score = torch.linalg.vector_norm(counterfactual_delta, ord=2, dim=-1)
+        t = target_index.long()
+        pos = effect_score.gather(1, t.unsqueeze(1)).squeeze(1)
+
+        neg_mask = valid_mask.clone()
+        neg_mask.scatter_(1, t.unsqueeze(1), False)
+        neg_scores = effect_score.masked_fill(~neg_mask, -1e4)
+        neg_lse = torch.logsumexp(neg_scores, dim=1)
+        neg_count = neg_mask.sum(dim=1).to(dtype=neg_lse.dtype).clamp(min=1.0)
+        neg_soft = neg_lse - neg_count.log()
+
+        per_sample = F.softplus(self.counterfactual_margin + (neg_soft - pos))
+        return (per_sample * sample_weights).mean()
+
     def _aux_sample_weights(
         self,
         importance_logits: torch.Tensor,
         valid_mask: torch.Tensor,
-        model_outputs: Optional[Dict[str, torch.Tensor]],
     ) -> torch.Tensor:
-        # Prefer routing-aware hard-case weights when model exposes them.
-        if model_outputs is not None and model_outputs.get("hard_case_ratio") is not None:
-            hard_ratio = model_outputs["hard_case_ratio"].detach().clamp(0.0, 1.0)
-        else:
-            masked = importance_logits.masked_fill(~valid_mask, -1e4)
-            conf = torch.softmax(masked, dim=1).max(dim=1).values
-            hard_ratio = torch.sigmoid((0.72 - conf) / 0.08)
+        masked = importance_logits.masked_fill(~valid_mask, -1e4)
+        conf = torch.softmax(masked, dim=1).max(dim=1).values
+        hard_ratio = torch.sigmoid((0.72 - conf) / 0.08)
 
         # Keep a non-zero floor so branches still receive weak supervision on easy samples.
         weights = 0.2 + hard_ratio
@@ -183,6 +188,16 @@ class CombinedLoss(nn.Module):
         # Preserve a floor to avoid zeroing gradient entirely.
         return (0.2 + sample_usage).clamp(max=1.2)
 
+    @staticmethod
+    def _branch_is_enabled(
+        model_outputs: Optional[Dict[str, torch.Tensor]],
+        branch_name: str,
+    ) -> bool:
+        if model_outputs is None:
+            return False
+        branch_names = model_outputs.get("branch_weight_names")
+        return isinstance(branch_names, list) and branch_name in branch_names
+
     def get_loss_components(
         self,
         *,
@@ -194,7 +209,7 @@ class CombinedLoss(nn.Module):
         if person_mask.ndim != 3:
             raise ValueError("person_mask 必须是三维张量 (B, T, N)")
         valid_mask = person_mask.any(dim=1)
-        aux_weights = self._aux_sample_weights(importance_logits, valid_mask, model_outputs)
+        aux_weights = self._aux_sample_weights(importance_logits, valid_mask)
         rel_usage = self._branch_usage_from_outputs(model_outputs=model_outputs, branch_name="rel", ref=importance_logits)
         cf_usage = self._branch_usage_from_outputs(
             model_outputs=model_outputs,
@@ -213,70 +228,59 @@ class CombinedLoss(nn.Module):
             else importance_logits.new_tensor(0.0)
         )
 
+        self_branch_loss = importance_logits.new_tensor(0.0)
         rel_branch_loss = importance_logits.new_tensor(0.0)
-        counterfactual_branch_loss = importance_logits.new_tensor(0.0)
-        moe_entropy_loss = importance_logits.new_tensor(0.0)
-        moe_load_balance_loss = importance_logits.new_tensor(0.0)
-        moe_router_z_loss = importance_logits.new_tensor(0.0)
+        counterfactual_effect_loss = importance_logits.new_tensor(0.0)
 
         if model_outputs is not None:
+            self_logits = model_outputs.get("importance_logits_self")
+            if self_logits is not None and self.self_branch_weight > 0:
+                self_imp = self._weighted_importance(self_logits, target_index, valid_mask, aux_weights)
+                self_pref = self._weighted_preference(self_logits, target_index, person_mask, aux_weights)
+                self_branch_loss = (
+                    self_imp * self.importance_weight + self_pref * self.preference_weight
+                ) * self.self_branch_weight
+
             rel_logits = model_outputs.get("importance_logits_rel")
-            if rel_logits is not None and self.rel_branch_weight > 0:
+            if (
+                rel_logits is not None
+                and self.rel_branch_weight > 0
+                and self._branch_is_enabled(model_outputs, "rel")
+            ):
                 rel_weights = aux_weights * rel_usage
                 rel_weights = rel_weights / rel_weights.mean().clamp(min=1e-6)
                 rel_imp = self._weighted_importance(rel_logits, target_index, valid_mask, rel_weights)
                 rel_pref = self._weighted_preference(rel_logits, target_index, person_mask, rel_weights)
                 rel_branch_loss = (rel_imp * self.importance_weight + rel_pref * self.preference_weight) * self.rel_branch_weight
 
-            cf_logits = model_outputs.get("importance_logits_counterfactual")
-            if cf_logits is not None and self.counterfactual_branch_weight > 0:
-                cf_weights = aux_weights * cf_usage
-                cf_weights = cf_weights / cf_weights.mean().clamp(min=1e-6)
-                cf_imp = self._weighted_importance(cf_logits, target_index, valid_mask, cf_weights)
-                cf_pref = self._weighted_preference(cf_logits, target_index, person_mask, cf_weights)
-                counterfactual_branch_loss = (
-                    (cf_imp * self.importance_weight + cf_pref * self.preference_weight)
-                    * self.counterfactual_branch_weight
+            cf_delta = model_outputs.get("counterfactual_delta")
+            if (
+                cf_delta is not None
+                and self.counterfactual_effect_weight > 0
+                and self._branch_is_enabled(model_outputs, "counterfactual")
+            ):
+                cf_effect_weights = aux_weights * cf_usage
+                cf_effect_weights = cf_effect_weights / cf_effect_weights.mean().clamp(min=1e-6)
+                cf_effect = self._weighted_counterfactual_effect(
+                    cf_delta,
+                    target_index,
+                    valid_mask,
+                    cf_effect_weights,
                 )
-
-            if self.moe_entropy_weight > 0:
-                entropy_total = (
-                    self._safe_mean_from_outputs(model_outputs, "relation_router_entropy", importance_logits)
-                    + self._safe_mean_from_outputs(model_outputs, "counterfactual_router_entropy", importance_logits)
-                    + self._safe_mean_from_outputs(model_outputs, "fusion_router_entropy", importance_logits)
-                )
-                moe_entropy_loss = entropy_total * self.moe_entropy_weight
-
-            if self.moe_load_balance_weight > 0:
-                load_balance_total = (
-                    self._safe_mean_from_outputs(model_outputs, "relation_load_balance_loss", importance_logits)
-                    + self._safe_mean_from_outputs(model_outputs, "counterfactual_load_balance_loss", importance_logits)
-                )
-                moe_load_balance_loss = load_balance_total * self.moe_load_balance_weight
-
-            if self.moe_router_z_weight > 0:
-                router_z_total = (
-                    self._safe_mean_from_outputs(model_outputs, "relation_router_z_loss", importance_logits)
-                    + self._safe_mean_from_outputs(model_outputs, "counterfactual_router_z_loss", importance_logits)
-                )
-                moe_router_z_loss = router_z_total * self.moe_router_z_weight
+                counterfactual_effect_loss = cf_effect * self.counterfactual_effect_weight
 
         total = (
             imp_loss
             + pref_loss
+            + self_branch_loss
             + rel_branch_loss
-            + counterfactual_branch_loss
-            + moe_entropy_loss
-            + moe_load_balance_loss
-            + moe_router_z_loss
+            + counterfactual_effect_loss
         )
         return {
             "importance_loss": imp_loss.detach(),
             "preference_loss": pref_loss.detach(),
+            "self_branch_loss": self_branch_loss.detach(),
             "rel_branch_loss": rel_branch_loss.detach(),
-            "counterfactual_branch_loss": counterfactual_branch_loss.detach(),
-            "moe_entropy_loss": moe_entropy_loss.detach(),
-            "moe_load_balance_loss": moe_load_balance_loss.detach(),
-            "moe_router_z_loss": moe_router_z_loss.detach(),
+            "counterfactual_effect_loss": counterfactual_effect_loss.detach(),
             "total_loss": total,
         }

@@ -92,13 +92,6 @@ class ScoringConfig:
 class RelationConfig:
     enabled: bool = True
     hidden_dim: int = 256
-    num_experts: int = 4
-    topk_experts: int = 2
-    dispatch_mode: str = "dense"
-    router_temperature: float = 1.0
-    router_noise_std: float = 0.0
-    capacity_factor: float = 1.25
-    drop_tokens: bool = False
     dropout: float = 0.1
 
 
@@ -106,31 +99,15 @@ class RelationConfig:
 class CounterfactualConfig:
     enabled: bool = True
     hidden_dim: int = 256
-    num_experts: int = 4
-    topk_experts: int = 2
-    dispatch_mode: str = "dense"
-    router_temperature: float = 1.0
-    router_noise_std: float = 0.0
-    capacity_factor: float = 1.25
-    drop_tokens: bool = False
     dropout: float = 0.1
 
 
 @dataclass
 class FusionConfig:
-    mode: str = "moe_residual"
-    hidden_dim: int = 128
-    topk_branches: int = 2
-    router_temperature: float = 1.0
-    aux_residual_scale: float = 0.75
+    feature_dim: int = 512
+    interaction_heads: int = 8
+    interaction_layers: int = 1
     dropout: float = 0.1
-    self_hard_conf_threshold: float = 0.72
-    self_hard_margin_threshold: float = 1.0
-    hard_temperature: float = 0.12
-    branch_conf_threshold: float = 0.56
-    branch_margin_threshold: float = 0.25
-    use_branch_rejection: bool = True
-    delta_logit_scale: float = 1.0
 
 
 @dataclass
@@ -138,11 +115,10 @@ class LossConfig:
     beta: float = 1.0
     importance_weight: float = 1.0
     preference_weight: float = 0.3
+    self_branch_weight: float = 0.20
     rel_branch_weight: float = 0.30
-    counterfactual_branch_weight: float = 0.30
-    moe_entropy_weight: float = 0.01
-    moe_load_balance_weight: float = 0.0
-    moe_router_z_weight: float = 0.0
+    counterfactual_effect_weight: float = 0.30
+    counterfactual_margin: float = 0.10
 
 
 @dataclass
@@ -181,7 +157,7 @@ class TrainingConfig:
     distributed: bool = False
     local_rank: int = 0
     world_size: int = 1
-    find_unused_parameters: bool = False
+    find_unused_parameters: bool = True
 
     num_workers: int = 4
     pin_memory: bool = True

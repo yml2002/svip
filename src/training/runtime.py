@@ -219,12 +219,15 @@ class TrainingRuntime:
             config.model.loss.importance_weight = float(self.args.importance_weight)
         if getattr(self.args, "preference_weight", None) is not None:
             config.model.loss.preference_weight = float(self.args.preference_weight)
+        if getattr(self.args, "self_branch_weight", None) is not None:
+            config.model.loss.self_branch_weight = float(self.args.self_branch_weight)
         if getattr(self.args, "rel_branch_weight", None) is not None:
             config.model.loss.rel_branch_weight = float(self.args.rel_branch_weight)
-        if getattr(self.args, "counterfactual_branch_weight", None) is not None:
-            config.model.loss.counterfactual_branch_weight = float(self.args.counterfactual_branch_weight)
-        if getattr(self.args, "moe_entropy_weight", None) is not None:
-            config.model.loss.moe_entropy_weight = float(self.args.moe_entropy_weight)
+        if getattr(self.args, "counterfactual_effect_weight", None) is not None:
+            config.model.loss.counterfactual_effect_weight = float(self.args.counterfactual_effect_weight)
+        if getattr(self.args, "counterfactual_margin", None) is not None:
+            config.model.loss.counterfactual_margin = float(self.args.counterfactual_margin)
+
         if getattr(self.args, "logit_temperature", None) is not None:
             config.model.scoring.temperature = float(self.args.logit_temperature)
 
