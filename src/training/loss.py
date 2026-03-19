@@ -100,14 +100,17 @@ class CombinedLoss(nn.Module):
         self.use_self_branch = bool(getattr(getattr(config.model, "self_branch", object()), "enabled", True))
         self.relation_residual_weight = float(getattr(config.model.loss, "relation_residual_weight", 1.0))
         self.counterfactual_residual_weight = float(getattr(config.model.loss, "counterfactual_residual_weight", 1.0))
+        # Enforce that each incremental branch should provide at least this relative CE gain over its base.
+        self.min_incremental_gain_ratio = 0.02
         logger.info(
-            "CombinedLoss: imp=%.3f pref=%.3f rel_res=%.3f cf_res=%.3f cf_eff=%.3f cf_margin=%.3f beta=%.3f",
+            "CombinedLoss: imp=%.3f pref=%.3f rel_res=%.3f cf_res=%.3f cf_eff=%.3f cf_margin=%.3f min_inc_gain=%.3f beta=%.3f",
             self.importance_weight,
             self.preference_weight,
             self.relation_residual_weight,
             self.counterfactual_residual_weight,
             self.counterfactual_effect_weight,
             self.counterfactual_margin,
+            self.min_incremental_gain_ratio,
             beta_cfg,
         )
 
@@ -131,6 +134,28 @@ class CombinedLoss(nn.Module):
 
         per_sample = F.softplus(self.counterfactual_margin + (neg_soft - pos))
         return per_sample.mean()
+
+    def _incremental_improvement_loss(
+        self,
+        *,
+        base_logits: torch.Tensor,
+        improved_logits: torch.Tensor,
+        target_index: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Penalize a branch when its increment fails to improve base enough.
+
+        Let L_base = CE(base), L_inc = CE(base + increment).
+        We require L_inc <= L_base * (1 - r), where r is min_incremental_gain_ratio.
+        This gives a clean dual effect in minimization:
+        - worse than base: penalized
+        - slightly better but below target gain: still penalized
+        - sufficiently better: zero auxiliary penalty
+        """
+        base_loss = self.importance(base_logits, target_index, valid_mask)
+        improved_loss = self.importance(improved_logits, target_index, valid_mask)
+        target_loss = base_loss.detach() * (1.0 - self.min_incremental_gain_ratio)
+        return torch.relu(improved_loss - target_loss)
 
     def get_loss_components(
         self,
@@ -170,8 +195,17 @@ class CombinedLoss(nn.Module):
             cf_logits = model_outputs.get("importance_logits_counterfactual")
 
             if self_logits is not None and rel_logits is not None and rel_res_weight > 0:
-                rel_stacked = self_logits.detach() + rel_logits
-                relation_residual_loss = self.importance(rel_stacked, target_index, valid_mask) * rel_res_weight
+                rel_base = self_logits.detach()
+                rel_stacked = rel_base + rel_logits
+                relation_residual_loss = (
+                    self._incremental_improvement_loss(
+                        base_logits=rel_base,
+                        improved_logits=rel_stacked,
+                        target_index=target_index,
+                        valid_mask=valid_mask,
+                    )
+                    * rel_res_weight
+                )
 
             if self_logits is not None and cf_logits is not None and cf_res_weight > 0:
                 cf_base = self_logits.detach()
@@ -179,7 +213,13 @@ class CombinedLoss(nn.Module):
                     cf_base = cf_base + rel_logits.detach()
                 cf_stacked = cf_base + cf_logits
                 counterfactual_residual_loss = (
-                    self.importance(cf_stacked, target_index, valid_mask) * cf_res_weight
+                    self._incremental_improvement_loss(
+                        base_logits=cf_base,
+                        improved_logits=cf_stacked,
+                        target_index=target_index,
+                        valid_mask=valid_mask,
+                    )
+                    * cf_res_weight
                 )
 
             cf_delta = model_outputs.get("counterfactual_delta")
