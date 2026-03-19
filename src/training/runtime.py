@@ -219,14 +219,43 @@ class TrainingRuntime:
             config.model.loss.importance_weight = float(self.args.importance_weight)
         if getattr(self.args, "preference_weight", None) is not None:
             config.model.loss.preference_weight = float(self.args.preference_weight)
-        if getattr(self.args, "self_branch_weight", None) is not None:
-            config.model.loss.self_branch_weight = float(self.args.self_branch_weight)
-        if getattr(self.args, "rel_branch_weight", None) is not None:
-            config.model.loss.rel_branch_weight = float(self.args.rel_branch_weight)
         if getattr(self.args, "counterfactual_effect_weight", None) is not None:
             config.model.loss.counterfactual_effect_weight = float(self.args.counterfactual_effect_weight)
         if getattr(self.args, "counterfactual_margin", None) is not None:
             config.model.loss.counterfactual_margin = float(self.args.counterfactual_margin)
+        if getattr(self.args, "relation_residual_weight", None) is not None:
+            config.model.loss.relation_residual_weight = float(self.args.relation_residual_weight)
+        if getattr(self.args, "counterfactual_residual_weight", None) is not None:
+            config.model.loss.counterfactual_residual_weight = float(self.args.counterfactual_residual_weight)
+        if getattr(self.args, "branch_gain_floor", None) is not None:
+            gain_floor = float(self.args.branch_gain_floor)
+            if gain_floor < 0.0:
+                raise ValueError(f"branch_gain_floor must be >= 0, got {gain_floor}")
+            config.model.scoring.gain_floor = gain_floor
+        if getattr(self.args, "confidence_gate_floor", None) is not None:
+            gate_floor = float(self.args.confidence_gate_floor)
+            if gate_floor < 0.0 or gate_floor > 1.0:
+                raise ValueError(f"confidence_gate_floor must be in [0,1], got {gate_floor}")
+            config.model.scoring.confidence_gate_floor = gate_floor
+        if bool(getattr(self.args, "disable_branch_logit_norm", False)):
+            config.model.scoring.normalize_branch_logits = False
+        if bool(getattr(self.args, "disable_confidence_gate", False)):
+            config.model.scoring.use_confidence_gate = False
+        if bool(getattr(self.args, "no_gat", False)):
+            config.model.gatv2.enabled = False
+        if getattr(self.args, "gat_topk_neighbors", None) is not None:
+            topk = int(self.args.gat_topk_neighbors)
+            if topk < 0:
+                raise ValueError(f"gat_topk_neighbors must be >= 0, got {topk}")
+            config.model.gatv2.topk_neighbors = topk
+        if getattr(self.args, "use_event_token", None) is not None:
+            config.model.temporal.use_event_token = bool(int(self.args.use_event_token))
+        if getattr(self.args, "self_enabled", None) is not None:
+            config.model.self_branch.enabled = bool(int(self.args.self_enabled))
+        if getattr(self.args, "relation_enabled", None) is not None:
+            config.model.relation.enabled = bool(int(self.args.relation_enabled))
+        if getattr(self.args, "counterfactual_enabled", None) is not None:
+            config.model.counterfactual.enabled = bool(int(self.args.counterfactual_enabled))
 
         if getattr(self.args, "logit_temperature", None) is not None:
             config.model.scoring.temperature = float(self.args.logit_temperature)
@@ -245,42 +274,92 @@ class TrainingRuntime:
         assert self.config is not None
 
         ratio = float(getattr(self.config.data, "data_ratio", 1.0) or 1.0)
+        data_root = Path(self.config.data.data_dir)
 
-        def _ratio_to_max_samples(split: str) -> int | None:
+        class _FileListDataset(MSGVIPDataset):
+            def __init__(self, file_list, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.file_list = [str(p) for p in file_list]
+
+        def _ratio_to_max_samples(split: str, *, required: bool = True) -> int | None:
+            split_dir = data_root / split
+            if not split_dir.exists():
+                if required:
+                    raise ValueError(f"Split directory not found: {split_dir}")
+                return None
+
             if ratio >= 1.0:
                 return int(getattr(self.config.data, "max_samples", None)) if getattr(self.config.data, "max_samples", None) is not None else None
 
-            split_dir = Path(self.config.data.data_dir) / split
             npz_files = list(split_dir.glob("*.npz"))
             total = len(npz_files)
             if total <= 0:
+                if required:
+                    raise ValueError(f"No NPZ files found in {split_dir}")
                 return None
             keep = max(1, int(math.ceil(total * ratio)))
             return keep
 
-        train_max = _ratio_to_max_samples("train")
-        val_max = _ratio_to_max_samples("val")
+        def _load_split_files(split: str, *, required: bool = True) -> list[Path]:
+            split_dir = data_root / split
+            if not split_dir.exists():
+                if required:
+                    raise ValueError(f"Split directory not found: {split_dir}")
+                return []
+
+            files = sorted(split_dir.glob("*.npz"))
+            if not files:
+                if required:
+                    raise ValueError(f"No NPZ files found in {split_dir}")
+                return []
+
+            max_keep = _ratio_to_max_samples(split, required=required)
+            return files[: int(max_keep)] if max_keep is not None else files
+
+        train_split_names = list(getattr(self.config.data, "train_splits", ["train", "test"]))
+        if not train_split_names:
+            raise ValueError("config.data.train_splits cannot be empty")
+        val_split_name = str(getattr(self.config.data, "val_split", "val"))
+
+        train_pool: list[Path] = []
+        split_counts: dict[str, int] = {}
+        for split_name in train_split_names:
+            files = _load_split_files(str(split_name), required=False)
+            if files:
+                train_pool.extend(files)
+                split_counts[str(split_name)] = len(files)
+            else:
+                split_counts[str(split_name)] = 0
+
+        train_pool = sorted(train_pool)
+        if not train_pool:
+            raise ValueError(
+                f"No NPZ files found for configured train_splits={train_split_names} under {data_root}"
+            )
+
+        missing_splits = [name for name, cnt in split_counts.items() if cnt == 0]
+        if missing_splits:
+            self.logger.warning(
+                "Some configured train_splits are empty/missing: %s",
+                ", ".join(missing_splits),
+            )
+        self.logger.info(
+            "Training splits=%s -> train_pool=%d (%s)",
+            train_split_names,
+            len(train_pool),
+            ", ".join(f"{k}:{v}" for k, v in split_counts.items()),
+        )
+
+        val_files = _load_split_files(val_split_name, required=True)
 
         # 把旧 val 的多少比例换进 train，同时从 train 换出同样数量到 val
         swap_splits = bool(getattr(self.args, "swap_splits", False))
         swap_fraction = float(getattr(self.args, "swap_fraction", 0.5))
 
         if not swap_splits or swap_fraction <= 0.0:
-            train_ds = MSGVIPDataset(config=self.config, data_path=self.config.data.data_dir, split="train", max_samples=train_max)
-            val_ds = MSGVIPDataset(config=self.config, data_path=self.config.data.data_dir, split="val", max_samples=val_max)
+            train_ds = _FileListDataset(train_pool, config=self.config, data_path=self.config.data.data_dir, split="train", max_samples=None)
+            val_ds = _FileListDataset(val_files, config=self.config, data_path=self.config.data.data_dir, split="val", max_samples=None)
         else:
-            data_root = Path(self.config.data.data_dir)
-            train_files = sorted((data_root / "train").glob("*.npz"))
-            val_files = sorted((data_root / "val").glob("*.npz"))
-
-            if not train_files:
-                raise ValueError(f"No NPZ files found in {data_root / 'train'}")
-            if not val_files:
-                raise ValueError(f"No NPZ files found in {data_root / 'val'}")
-
-            train_files = train_files[: int(train_max)] if train_max is not None else train_files
-            val_files = val_files[: int(val_max)] if val_max is not None else val_files
-
             import numpy as np
             from collections import defaultdict
 
@@ -292,15 +371,15 @@ class TrainingRuntime:
                 return (str(sc), n_people)
 
             buckets: dict[tuple[str, int], list[Path]] = defaultdict(list)
-            for p in train_files:
+            for p in train_pool:
                 buckets[_bucket_key(p)].append(p)
             for p in val_files:
                 buckets[_bucket_key(p)].append(p)
 
-            target_train = len(train_files)
+            target_train = len(train_pool)
             target_val = len(val_files)
 
-            old_train_set = set(train_files)
+            old_train_set = set(train_pool)
             old_val_set = set(val_files)
 
             new_train: list[Path] = []
@@ -328,11 +407,6 @@ class TrainingRuntime:
 
             new_train = _pad_or_trim(new_train, new_val, target_train)
             new_val = _pad_or_trim(new_val, new_train, target_val)
-
-            class _FileListDataset(MSGVIPDataset):
-                def __init__(self, file_list, *args, **kwargs):
-                    super().__init__(*args, **kwargs)
-                    self.file_list = [str(p) for p in file_list]
 
             train_ds = _FileListDataset(new_train, config=self.config, data_path=self.config.data.data_dir, split="train", max_samples=None)
             val_ds = _FileListDataset(new_val, config=self.config, data_path=self.config.data.data_dir, split="val", max_samples=None)

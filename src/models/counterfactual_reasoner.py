@@ -35,7 +35,7 @@ class DenseAdapter(nn.Module):
 
 
 class RelationReasoner(nn.Module):
-    """Build person-discriminative relation features and logits."""
+    """Build person-discriminative relation features."""
 
     def __init__(
         self,
@@ -56,12 +56,6 @@ class RelationReasoner(nn.Module):
             out_dim=int(out_dim),
             hidden_dim=int(hidden_dim),
             dropout=float(dropout),
-        )
-        self.head = nn.Sequential(
-            nn.Linear(int(out_dim), int(hidden_dim)),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(int(hidden_dim), 1),
         )
 
     def forward(self, tokens: torch.Tensor, person_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -90,17 +84,14 @@ class RelationReasoner(nn.Module):
             dim=-1,
         )
         relation_feat = self.adapter(relation_input, valid_mask)
-        relation_logits = self.head(relation_feat).squeeze(-1).masked_fill(~valid_mask, -1e4)
-
         return {
             "relation_features": relation_feat,
-            "relation_logits": relation_logits,
             "relation_attention": attn,
         }
 
 
 class CounterfactualReasoner(nn.Module):
-    """Estimate person-level counterfactual effect and logits."""
+    """Estimate person-level counterfactual effect and features."""
 
     def __init__(
         self,
@@ -121,12 +112,6 @@ class CounterfactualReasoner(nn.Module):
             out_dim=int(out_dim),
             hidden_dim=int(hidden_dim),
             dropout=float(dropout),
-        )
-        self.head = nn.Sequential(
-            nn.Linear(int(out_dim), int(hidden_dim)),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(int(hidden_dim), 1),
         )
         self.delta_refiner = nn.Sequential(
             nn.Linear(int(out_dim), int(hidden_dim)),
@@ -162,14 +147,11 @@ class CounterfactualReasoner(nn.Module):
 
         delta_refine = self.delta_refiner(cf_feat)
         delta = (delta_raw + delta_refine) * valid_mask.to(dtype=delta_raw.dtype).unsqueeze(-1)
-        cf_logits = self.head(cf_feat).squeeze(-1).masked_fill(~valid_mask, -1e4)
-
         return {
             "counterfactual_features": cf_feat,
             "counterfactual_delta": delta,
             "counterfactual_delta_raw": delta_raw,
             "counterfactual_delta_refine": delta_refine,
-            "counterfactual_logits": cf_logits,
             "counterfactual_attention": attn,
             "event_state": factual_event,
         }

@@ -15,11 +15,12 @@ from typing import Optional
 @dataclass
 class DataConfig:
     data_dir: str = "data/shared_data/preprocessed_fixed"
+    # train_splits: list[str] = field(default_factory=lambda: ["train", "test"])
+    train_splits: list[str] = field(default_factory=lambda: ["train"])
+    val_split: str = "val"
     video_length: int = 120
     # video_length: int = 96
     max_persons: int = 16
-    image_height: int = 192
-    image_width: int = 336
     cache_data: bool = False
     max_samples: Optional[int] = None
     data_ratio: float = 1.0
@@ -63,29 +64,33 @@ class GATv2Config:
     hidden_dim: int = 512
     num_layers: int = 2
     heads: int = 4
-    use_residual: bool = True
+    topk_neighbors: int = 4
 
 
 @dataclass
 class TemporalTransformerConfig:
-    enabled: bool = True
     d_model: int = 768
     nhead: int = 12
     num_layers: int = 2
     dim_feedforward: int = 1024
     use_event_token: bool = True
     event_num_layers: int = 1
-    agg_heads: int = 4
     agg_out_dim: int = 512
-    pooling: Optional[str] = "attention"
-    transformer_layers: int = 1
-    use_video_transformer: bool = True
 
 
 @dataclass
 class ScoringConfig:
     hidden_dim: int = 256
     temperature: float = 1.0
+    normalize_branch_logits: bool = True
+    gain_floor: float = 0.05
+    use_confidence_gate: bool = True
+    confidence_gate_floor: float = 0.05
+
+
+@dataclass
+class SelfBranchConfig:
+    enabled: bool = True
 
 
 @dataclass
@@ -103,22 +108,14 @@ class CounterfactualConfig:
 
 
 @dataclass
-class FusionConfig:
-    feature_dim: int = 512
-    interaction_heads: int = 8
-    interaction_layers: int = 1
-    dropout: float = 0.1
-
-
-@dataclass
 class LossConfig:
     beta: float = 1.0
     importance_weight: float = 1.0
-    preference_weight: float = 0.3
-    self_branch_weight: float = 0.20
-    rel_branch_weight: float = 0.30
+    preference_weight: float = 0.0
     counterfactual_effect_weight: float = 0.30
     counterfactual_margin: float = 0.10
+    relation_residual_weight: float = 1.0
+    counterfactual_residual_weight: float = 1.0
 
 
 @dataclass
@@ -128,9 +125,9 @@ class ModelConfig:
     gatv2: GATv2Config = field(default_factory=GATv2Config)
     temporal: TemporalTransformerConfig = field(default_factory=TemporalTransformerConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
+    self_branch: SelfBranchConfig = field(default_factory=SelfBranchConfig)
     relation: RelationConfig = field(default_factory=RelationConfig)
     counterfactual: CounterfactualConfig = field(default_factory=CounterfactualConfig)
-    fusion: FusionConfig = field(default_factory=FusionConfig)
     loss: LossConfig = field(default_factory=LossConfig)
 
 
@@ -146,9 +143,6 @@ class TrainingConfig:
     accumulation_steps: int = 8
     roi_chunk: int = 128
     export_train_predictions: bool = False
-
-    enable_dual_head: bool = True
-    gate_hidden_dim: int = 128
 
     use_mixed_precision: bool = True
     activation_checkpointing: bool = True

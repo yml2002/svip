@@ -155,10 +155,61 @@ def parse_args(argv=None):
 
     parser.add_argument("--importance_weight", type=float, default=None)
     parser.add_argument("--preference_weight", type=float, default=None)
-    parser.add_argument("--self_branch_weight", type=float, default=None)
-    parser.add_argument("--rel_branch_weight", type=float, default=None)
     parser.add_argument("--counterfactual_effect_weight", type=float, default=None)
     parser.add_argument("--counterfactual_margin", type=float, default=None)
+    parser.add_argument("--relation_residual_weight", type=float, default=None)
+    parser.add_argument("--counterfactual_residual_weight", type=float, default=None)
+    parser.add_argument("--branch_gain_floor", type=float, default=None)
+    parser.add_argument("--confidence_gate_floor", type=float, default=None)
+    parser.add_argument(
+        "--disable_branch_logit_norm",
+        action="store_true",
+        help="Disable per-branch valid-logit normalization before additive fusion",
+    )
+    parser.add_argument(
+        "--disable_confidence_gate",
+        action="store_true",
+        help="Disable confidence-based gating for rel/cf branch increments",
+    )
+    parser.add_argument(
+        "--no_gat",
+        action="store_true",
+        help="Disable social GAT message passing completely",
+    )
+    parser.add_argument(
+        "--gat_topk_neighbors",
+        type=int,
+        default=None,
+        help="Top-k neighbors per node for relation graph edges (0 means dense graph)",
+    )
+    parser.add_argument(
+        "--use_event_token",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="Enable event token context (1) or disable it (0)",
+    )
+    parser.add_argument(
+        "--self_enabled",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="Enable self branch (1) or disable it (0)",
+    )
+    parser.add_argument(
+        "--relation_enabled",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="Enable relation branch (1) or disable it (0)",
+    )
+    parser.add_argument(
+        "--counterfactual_enabled",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="Enable counterfactual branch (1) or disable it (0)",
+    )
     parser.add_argument("--logit_temperature", type=float, default=None)
     parser.add_argument("--swap_splits", action="store_true")
     parser.add_argument("--swap_fraction", type=float, default=0.5)

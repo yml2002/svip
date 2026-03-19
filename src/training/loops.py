@@ -83,6 +83,60 @@ def compute_rankk_global(
 logger = logging.getLogger(__name__)
 
 
+def _mean_abs_valid(logits: torch.Tensor | None, valid_mask: torch.Tensor) -> float:
+    if logits is None:
+        return 0.0
+    mask = valid_mask.bool()
+    if mask.dim() > 2:
+        mask = mask.any(dim=1)
+    if not bool(mask.any()):
+        return 0.0
+    vals = logits.masked_select(mask)
+    if vals.numel() == 0:
+        return 0.0
+    return float(vals.abs().mean().item())
+
+
+def _module_grad_l2(model: torch.nn.Module, module_name: str) -> float:
+    module = getattr(model, module_name, None)
+    if module is None:
+        return 0.0
+    sq_sum = 0.0
+    has_grad = False
+    for p in module.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        sq_sum += float((g * g).sum().item())
+        has_grad = True
+    if not has_grad:
+        return 0.0
+    return float(sq_sum ** 0.5)
+
+
+def _to_float_scalar(value: torch.Tensor | float | int | None) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return 0.0
+        return float(value.detach().reshape(-1)[0].item())
+    return float(value)
+
+
+def _mean_scalar(value: torch.Tensor | None) -> float:
+    if value is None:
+        return 0.0
+    if value.numel() == 0:
+        return 0.0
+    return float(value.detach().mean().item())
+
+
+def _safe_ratio(numer: float, preferred_denom: float, fallback_denom: float, eps: float = 1e-8) -> float:
+    denom = preferred_denom if preferred_denom > eps else fallback_denom
+    return float(numer / max(denom, eps))
+
+
 def export_predictions_csv(
     *,
     trainer,
@@ -109,14 +163,33 @@ def export_predictions_csv(
     )
 
 
-def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, float]:
+def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, float, Dict[str, float]]:
     trainer.model.train()
     trainer.optimizer.zero_grad(set_to_none=True)
 
     epoch_loss = 0.0
     epoch_imp_loss = 0.0
     epoch_pref_loss = 0.0
+    epoch_cf_effect_loss = 0.0
+    epoch_rel_residual_loss = 0.0
+    epoch_cf_residual_loss = 0.0
     num_batches = 0
+    self_abs_sum = 0.0
+    rel_abs_sum = 0.0
+    cf_abs_sum = 0.0
+    rel_ratio_sum = 0.0
+    cf_ratio_sum = 0.0
+    gain_self_sum = 0.0
+    gain_rel_sum = 0.0
+    gain_cf_sum = 0.0
+    gate_sum = 0.0
+
+    rel_scoring_grad_sum = 0.0
+    cf_scoring_grad_sum = 0.0
+    relation_reasoner_grad_sum = 0.0
+    counterfactual_reasoner_grad_sum = 0.0
+    grad_steps = 0
+
     running_correct = 0
     running_total = 0
 
@@ -160,6 +233,21 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
             )
             loss = loss_components["total_loss"] / trainer.accumulation_steps
 
+        pm = batch["person_mask"]
+        valid_mask = pm.any(dim=1) if pm.dim() == 3 else pm
+        self_abs_sum += _mean_abs_valid(outputs.get("importance_logits_self"), valid_mask)
+        rel_abs_sum += _mean_abs_valid(outputs.get("importance_logits_rel"), valid_mask)
+        cf_abs_sum += _mean_abs_valid(outputs.get("importance_logits_counterfactual"), valid_mask)
+        cur_self_abs = _mean_abs_valid(outputs.get("importance_logits_self"), valid_mask)
+        cur_rel_abs = _mean_abs_valid(outputs.get("importance_logits_rel"), valid_mask)
+        cur_cf_abs = _mean_abs_valid(outputs.get("importance_logits_counterfactual"), valid_mask)
+        rel_ratio_sum += _safe_ratio(cur_rel_abs, cur_self_abs, cur_rel_abs)
+        cf_ratio_sum += _safe_ratio(cur_cf_abs, cur_self_abs, max(cur_rel_abs, cur_cf_abs))
+        gain_self_sum += _to_float_scalar(outputs.get("branch_gain_self"))
+        gain_rel_sum += _to_float_scalar(outputs.get("branch_gain_rel"))
+        gain_cf_sum += _to_float_scalar(outputs.get("branch_gain_cf"))
+        gate_sum += _mean_scalar(outputs.get("branch_confidence_gate"))
+
         if torch.isnan(loss):
             trainer.optimizer.zero_grad(set_to_none=True)
             continue
@@ -175,6 +263,13 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
                 trainer.scaler.unscale_(trainer.optimizer)
             torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.max_grad_norm)
 
+            model_ref = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+            rel_scoring_grad_sum += _module_grad_l2(model_ref, "rel_scoring")
+            cf_scoring_grad_sum += _module_grad_l2(model_ref, "cf_scoring")
+            relation_reasoner_grad_sum += _module_grad_l2(model_ref, "relation_reasoner")
+            counterfactual_reasoner_grad_sum += _module_grad_l2(model_ref, "counterfactual_reasoner")
+            grad_steps += 1
+
             if trainer.scaler is not None:
                 trainer.scaler.step(trainer.optimizer)
                 trainer.scaler.update()
@@ -189,6 +284,9 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
         epoch_loss += loss_value
         epoch_imp_loss += float(loss_components["importance_loss"].item())
         epoch_pref_loss += float(loss_components["preference_loss"].item())
+        epoch_rel_residual_loss += float(loss_components.get("relation_residual_loss", loss_components["total_loss"].new_tensor(0.0)).item())
+        epoch_cf_residual_loss += float(loss_components.get("counterfactual_residual_loss", loss_components["total_loss"].new_tensor(0.0)).item())
+        epoch_cf_effect_loss += float(loss_components.get("counterfactual_effect_loss", loss_components["total_loss"].new_tensor(0.0)).item())
         num_batches += 1
 
         acc_metrics = compute_accuracy_metrics(outputs["importance_logits"], batch["target_index"], batch["person_mask"])
@@ -242,6 +340,13 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
             trainer.scaler.unscale_(trainer.optimizer)
         torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.max_grad_norm)
 
+        model_ref = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+        rel_scoring_grad_sum += _module_grad_l2(model_ref, "rel_scoring")
+        cf_scoring_grad_sum += _module_grad_l2(model_ref, "cf_scoring")
+        relation_reasoner_grad_sum += _module_grad_l2(model_ref, "relation_reasoner")
+        counterfactual_reasoner_grad_sum += _module_grad_l2(model_ref, "counterfactual_reasoner")
+        grad_steps += 1
+
         if trainer.scaler is not None:
             trainer.scaler.step(trainer.optimizer)
             trainer.scaler.update()
@@ -276,16 +381,51 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
 
     avg_imp_loss = epoch_imp_loss / max(1, num_batches)
     avg_pref_loss = epoch_pref_loss / max(1, num_batches)
-    return avg_loss, avg_acc, avg_imp_loss, avg_pref_loss
+    avg_cf_effect_loss = epoch_cf_effect_loss / max(1, num_batches)
+    avg_rel_residual_loss = epoch_rel_residual_loss / max(1, num_batches)
+    avg_cf_residual_loss = epoch_cf_residual_loss / max(1, num_batches)
+
+    diagnostics = {
+        "train_self_logit_abs": self_abs_sum / max(1, num_batches),
+        "train_rel_logit_abs": rel_abs_sum / max(1, num_batches),
+        "train_cf_logit_abs": cf_abs_sum / max(1, num_batches),
+        "train_rel_self_ratio": rel_ratio_sum / max(1, num_batches),
+        "train_cf_self_ratio": cf_ratio_sum / max(1, num_batches),
+        "train_gain_self": gain_self_sum / max(1, num_batches),
+        "train_gain_rel": gain_rel_sum / max(1, num_batches),
+        "train_gain_cf": gain_cf_sum / max(1, num_batches),
+        "train_branch_confidence_gate": gate_sum / max(1, num_batches),
+        "train_relation_residual_loss": avg_rel_residual_loss,
+        "train_counterfactual_residual_loss": avg_cf_residual_loss,
+        "train_cf_effect_loss": avg_cf_effect_loss,
+        "grad_rel_scoring_l2": rel_scoring_grad_sum / max(1, grad_steps),
+        "grad_cf_scoring_l2": cf_scoring_grad_sum / max(1, grad_steps),
+        "grad_relation_reasoner_l2": relation_reasoner_grad_sum / max(1, grad_steps),
+        "grad_counterfactual_reasoner_l2": counterfactual_reasoner_grad_sum / max(1, grad_steps),
+    }
+    return avg_loss, avg_acc, avg_imp_loss, avg_pref_loss, diagnostics
 
 
 @torch.no_grad()
-def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, float, float, float, float]:
+def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, float, float, float, float, Dict[str, float]]:
     trainer.model.eval()
 
     epoch_loss = 0.0
     epoch_imp_loss = 0.0
     epoch_pref_loss = 0.0
+    epoch_cf_effect_loss = 0.0
+    epoch_rel_residual_loss = 0.0
+    epoch_cf_residual_loss = 0.0
+    self_abs_sum = 0.0
+    rel_abs_sum = 0.0
+    cf_abs_sum = 0.0
+    rel_ratio_sum = 0.0
+    cf_ratio_sum = 0.0
+    gain_self_sum = 0.0
+    gain_rel_sum = 0.0
+    gain_cf_sum = 0.0
+    gate_sum = 0.0
+
     num_batches = 0
     running_correct = 0
     running_total = 0
@@ -341,6 +481,9 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
         epoch_loss += loss_value
         epoch_imp_loss += float(loss_components["importance_loss"].item())
         epoch_pref_loss += float(loss_components["preference_loss"].item())
+        epoch_rel_residual_loss += float(loss_components.get("relation_residual_loss", loss_components["total_loss"].new_tensor(0.0)).item())
+        epoch_cf_residual_loss += float(loss_components.get("counterfactual_residual_loss", loss_components["total_loss"].new_tensor(0.0)).item())
+        epoch_cf_effect_loss += float(loss_components.get("counterfactual_effect_loss", loss_components["total_loss"].new_tensor(0.0)).item())
         num_batches += 1
 
         acc_metrics = compute_accuracy_metrics(outputs["importance_logits"], batch["target_index"], batch["person_mask"])
@@ -349,6 +492,18 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
 
         pm = batch["person_mask"]
         valid_mask = pm.any(dim=1) if pm.dim() == 3 else pm
+        self_abs_sum += _mean_abs_valid(outputs.get("importance_logits_self"), valid_mask)
+        rel_abs_sum += _mean_abs_valid(outputs.get("importance_logits_rel"), valid_mask)
+        cf_abs_sum += _mean_abs_valid(outputs.get("importance_logits_counterfactual"), valid_mask)
+        cur_self_abs = _mean_abs_valid(outputs.get("importance_logits_self"), valid_mask)
+        cur_rel_abs = _mean_abs_valid(outputs.get("importance_logits_rel"), valid_mask)
+        cur_cf_abs = _mean_abs_valid(outputs.get("importance_logits_counterfactual"), valid_mask)
+        rel_ratio_sum += _safe_ratio(cur_rel_abs, cur_self_abs, cur_rel_abs)
+        cf_ratio_sum += _safe_ratio(cur_cf_abs, cur_self_abs, max(cur_rel_abs, cur_cf_abs))
+        gain_self_sum += _to_float_scalar(outputs.get("branch_gain_self"))
+        gain_rel_sum += _to_float_scalar(outputs.get("branch_gain_rel"))
+        gain_cf_sum += _to_float_scalar(outputs.get("branch_gain_cf"))
+        gate_sum += _mean_scalar(outputs.get("branch_confidence_gate"))
 
         # K per sample = number of valid persons in candidate set.
         # valid_mask: (B,N) bool
@@ -422,7 +577,21 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
 
         if trainer.rank != 0:
             # Non-main ranks don't compute global metrics/export.
-            return avg_loss, avg_acc, 0.0, 0.0, 0.0, avg_imp_loss, avg_pref_loss
+            diagnostics = {
+                "val_self_logit_abs": self_abs_sum / max(1, num_batches),
+                "val_rel_logit_abs": rel_abs_sum / max(1, num_batches),
+                "val_cf_logit_abs": cf_abs_sum / max(1, num_batches),
+                "val_rel_self_ratio": rel_ratio_sum / max(1, num_batches),
+                "val_cf_self_ratio": cf_ratio_sum / max(1, num_batches),
+                "val_gain_self": gain_self_sum / max(1, num_batches),
+                "val_gain_rel": gain_rel_sum / max(1, num_batches),
+                "val_gain_cf": gain_cf_sum / max(1, num_batches),
+                "val_branch_confidence_gate": gate_sum / max(1, num_batches),
+                "val_relation_residual_loss": epoch_rel_residual_loss / max(1, num_batches),
+                "val_counterfactual_residual_loss": epoch_cf_residual_loss / max(1, num_batches),
+                "val_cf_effect_loss": epoch_cf_effect_loss / max(1, num_batches),
+            }
+            return avg_loss, avg_acc, 0.0, 0.0, 0.0, avg_imp_loss, avg_pref_loss, diagnostics
 
         targets_all = torch.cat([g["targets"] for g in gathered if g is not None], dim=0)
         top3_all = torch.cat([g["top3"] for g in gathered if g is not None], dim=0)
@@ -547,4 +716,18 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
     trainer.record_logger.log_classwise_metrics(int(trainer.current_epoch) + 1, classwise)
     # Attach bucketed rank@k for trainer logging if available.
     trainer._rank_by_k = rank_by_k
-    return avg_loss, avg_acc, rank1, rank2, rank3, avg_imp_loss, avg_pref_loss
+    diagnostics = {
+        "val_self_logit_abs": self_abs_sum / max(1, num_batches),
+        "val_rel_logit_abs": rel_abs_sum / max(1, num_batches),
+        "val_cf_logit_abs": cf_abs_sum / max(1, num_batches),
+        "val_rel_self_ratio": rel_ratio_sum / max(1, num_batches),
+        "val_cf_self_ratio": cf_ratio_sum / max(1, num_batches),
+        "val_gain_self": gain_self_sum / max(1, num_batches),
+        "val_gain_rel": gain_rel_sum / max(1, num_batches),
+        "val_gain_cf": gain_cf_sum / max(1, num_batches),
+        "val_branch_confidence_gate": gate_sum / max(1, num_batches),
+        "val_relation_residual_loss": epoch_rel_residual_loss / max(1, num_batches),
+        "val_counterfactual_residual_loss": epoch_cf_residual_loss / max(1, num_batches),
+        "val_cf_effect_loss": epoch_cf_effect_loss / max(1, num_batches),
+    }
+    return avg_loss, avg_acc, rank1, rank2, rank3, avg_imp_loss, avg_pref_loss, diagnostics

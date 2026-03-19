@@ -206,8 +206,8 @@ class MemoryEfficientTrainer:
                 train_sampler.set_epoch(epoch)
 
             t_epoch0 = time.perf_counter() if self._is_main_process() else 0.0
-            train_loss, train_acc, train_imp_loss, train_pref_loss = train_epoch(self, log_every=10)
-            val_loss, val_acc, r1, r2, r3, val_imp_loss, val_pref_loss = validate_epoch(self, log_every=10)
+            train_loss, train_acc, train_imp_loss, train_pref_loss, train_diag = train_epoch(self, log_every=10)
+            val_loss, val_acc, r1, r2, r3, val_imp_loss, val_pref_loss, val_diag = validate_epoch(self, log_every=10)
             t_epoch1 = time.perf_counter() if self._is_main_process() else 0.0
 
             train_losses.append(train_loss)
@@ -238,6 +238,40 @@ class MemoryEfficientTrainer:
                         "rank@1": r1,
                         "rank@2": r2,
                         "rank@3": r3,
+                    }
+                )
+
+                self.record_logger.log_diagnostics(
+                    {
+                        "epoch": epoch,
+                        "train_self_logit_abs": float(train_diag.get("train_self_logit_abs", 0.0)),
+                        "train_rel_logit_abs": float(train_diag.get("train_rel_logit_abs", 0.0)),
+                        "train_cf_logit_abs": float(train_diag.get("train_cf_logit_abs", 0.0)),
+                        "train_rel_self_ratio": float(train_diag.get("train_rel_self_ratio", 0.0)),
+                        "train_cf_self_ratio": float(train_diag.get("train_cf_self_ratio", 0.0)),
+                        "train_gain_self": float(train_diag.get("train_gain_self", 0.0)),
+                        "train_gain_rel": float(train_diag.get("train_gain_rel", 0.0)),
+                        "train_gain_cf": float(train_diag.get("train_gain_cf", 0.0)),
+                        "train_branch_confidence_gate": float(train_diag.get("train_branch_confidence_gate", 0.0)),
+                        "train_relation_residual_loss": float(train_diag.get("train_relation_residual_loss", 0.0)),
+                        "train_counterfactual_residual_loss": float(train_diag.get("train_counterfactual_residual_loss", 0.0)),
+                        "train_cf_effect_loss": float(train_diag.get("train_cf_effect_loss", 0.0)),
+                        "grad_rel_scoring_l2": float(train_diag.get("grad_rel_scoring_l2", 0.0)),
+                        "grad_cf_scoring_l2": float(train_diag.get("grad_cf_scoring_l2", 0.0)),
+                        "grad_relation_reasoner_l2": float(train_diag.get("grad_relation_reasoner_l2", 0.0)),
+                        "grad_counterfactual_reasoner_l2": float(train_diag.get("grad_counterfactual_reasoner_l2", 0.0)),
+                        "val_self_logit_abs": float(val_diag.get("val_self_logit_abs", 0.0)),
+                        "val_rel_logit_abs": float(val_diag.get("val_rel_logit_abs", 0.0)),
+                        "val_cf_logit_abs": float(val_diag.get("val_cf_logit_abs", 0.0)),
+                        "val_rel_self_ratio": float(val_diag.get("val_rel_self_ratio", 0.0)),
+                        "val_cf_self_ratio": float(val_diag.get("val_cf_self_ratio", 0.0)),
+                        "val_gain_self": float(val_diag.get("val_gain_self", 0.0)),
+                        "val_gain_rel": float(val_diag.get("val_gain_rel", 0.0)),
+                        "val_gain_cf": float(val_diag.get("val_gain_cf", 0.0)),
+                        "val_branch_confidence_gate": float(val_diag.get("val_branch_confidence_gate", 0.0)),
+                        "val_relation_residual_loss": float(val_diag.get("val_relation_residual_loss", 0.0)),
+                        "val_counterfactual_residual_loss": float(val_diag.get("val_counterfactual_residual_loss", 0.0)),
+                        "val_cf_effect_loss": float(val_diag.get("val_cf_effect_loss", 0.0)),
                     }
                 )
 
@@ -302,7 +336,10 @@ class MemoryEfficientTrainer:
                 logger.info(
                     "Epoch %d: train_acc=%.4f train_loss=%.4f (imp=%.4f pref=%.4f) "
                     "val_acc=%.4f val_loss=%.4f (imp=%.4f pref=%.4f) "
-                    "rank1=%.2f%% rank2=%.2f%% rank3=%.2f%% lr=%.6f group_lrs=[%s] dt=%.1fs",
+                    "rank1=%.2f%% rank2=%.2f%% rank3=%.2f%% "
+                    "branch_abs(train self=%.3f rel=%.3f cf=%.3f; val self=%.3f rel=%.3f cf=%.3f) "
+                    "grad_l2(rel=%.3f cf=%.3f rel_reasoner=%.3f cf_reasoner=%.3f) "
+                    "lr=%.6f group_lrs=[%s] dt=%.1fs",
                     int(epoch),
                     float(train_acc),
                     float(train_loss),
@@ -315,6 +352,16 @@ class MemoryEfficientTrainer:
                     float(r1),
                     float(r2),
                     float(r3),
+                    float(train_diag.get("train_self_logit_abs", 0.0)),
+                    float(train_diag.get("train_rel_logit_abs", 0.0)),
+                    float(train_diag.get("train_cf_logit_abs", 0.0)),
+                    float(val_diag.get("val_self_logit_abs", 0.0)),
+                    float(val_diag.get("val_rel_logit_abs", 0.0)),
+                    float(val_diag.get("val_cf_logit_abs", 0.0)),
+                    float(train_diag.get("grad_rel_scoring_l2", 0.0)),
+                    float(train_diag.get("grad_cf_scoring_l2", 0.0)),
+                    float(train_diag.get("grad_relation_reasoner_l2", 0.0)),
+                    float(train_diag.get("grad_counterfactual_reasoner_l2", 0.0)),
                     float(self.config.training.learning_rate),
                     group_lr_str,
                     float(epoch_dt),

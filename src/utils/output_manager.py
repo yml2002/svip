@@ -26,9 +26,11 @@ class OutputManager:
         if self.records_dir is not None:
             self.records_dir.mkdir(parents=True, exist_ok=True)
             self._csv_path = self.records_dir / "losses.csv"
+            self._diag_csv_path = self.records_dir / "diagnostics.csv"
             self._json_path = self.records_dir / "metrics.jsonl"
         else:
             self._csv_path = None
+            self._diag_csv_path = None
             self._json_path = None
 
         self._csv_header_written = bool(self._csv_path and self._csv_path.exists())
@@ -36,6 +38,12 @@ class OutputManager:
         if self._csv_header_written and self._csv_path is not None:
             header_line = self._csv_path.open("r", encoding="utf-8").readline().strip()
             self._csv_header = header_line.split(",") if header_line else None
+
+        self._diag_csv_header_written = bool(self._diag_csv_path and self._diag_csv_path.exists())
+        self._diag_csv_header: Optional[list[str]] = None
+        if self._diag_csv_header_written and self._diag_csv_path is not None:
+            header_line = self._diag_csv_path.open("r", encoding="utf-8").readline().strip()
+            self._diag_csv_header = header_line.split(",") if header_line else None
 
         self._classwise_dir: Optional[Path] = None
         if self.predictions_dir is not None:
@@ -87,6 +95,32 @@ class OutputManager:
 
         with self._json_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def log_diagnostics(self, payload: Dict[str, Any]) -> None:
+        if self.records_dir is None or self._diag_csv_path is None:
+            return
+
+        flat = {k: v for k, v in payload.items() if isinstance(v, (int, float, str)) or v is None}
+        if not flat:
+            return
+
+        flat = {k: self._round4(v) for k, v in flat.items()}
+        flat.setdefault("epoch", None)
+
+        if not self._diag_csv_header_written:
+            header = list(flat.keys())
+            with self._diag_csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=header)
+                writer.writeheader()
+                writer.writerow(flat)
+            self._diag_csv_header_written = True
+            self._diag_csv_header = header
+            return
+
+        header = self._diag_csv_header or list(flat.keys())
+        with self._diag_csv_path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=header)
+            writer.writerow({k: flat.get(k) for k in header})
 
     def log_epoch(self, payload: Dict[str, Any]) -> None:
         if self.records_dir is None or self._csv_path is None or self._json_path is None:

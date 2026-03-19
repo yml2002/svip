@@ -15,7 +15,6 @@ from src.models.counterfactual_reasoner import CounterfactualReasoner, RelationR
 from src.models.event_context import EventTokenContext
 from src.models.vision_encoder import VisionEncoder
 from src.models.gatv2 import GATv2Stack
-from src.models.video_aggregator import VideoLevelAggregator
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +68,7 @@ def roi_crop_valid_batch(
 
 
 class TemporalEncoder(nn.Module):
-    """Per-person temporal encoder.
-
-    We keep a lightweight TransformerEncoder over time and then apply an
-    attention pooling (VideoLevelAggregator) to focus on key moments.
-    """
+    """Per-person temporal encoder (Transformer over time)."""
 
     def __init__(
         self,
@@ -111,9 +106,10 @@ class ImportanceRanker(nn.Module):
         gat_cfg = config.model.gatv2
         tmp_cfg = config.model.temporal
         sc_cfg = config.model.scoring
+        self_cfg = getattr(config.model, "self_branch", None)
         rel_cfg = config.model.relation
         cf_cfg = config.model.counterfactual
-        fusion_cfg = config.model.fusion
+        self.use_self_branch = bool(getattr(self_cfg, "enabled", True)) if self_cfg is not None else True
         self.use_relation_branch = bool(getattr(rel_cfg, "enabled", True))
         self.use_counterfactual_branch = bool(getattr(cf_cfg, "enabled", True))
 
@@ -137,14 +133,25 @@ class ImportanceRanker(nn.Module):
             nn.Dropout(float(config.model.dropout.features)),
         )
 
-        self.gat = GATv2Stack(
-            in_dim=int(feat_cfg.fused_dim),
-            hidden_dim=int(gat_cfg.hidden_dim),
-            num_layers=int(gat_cfg.num_layers),
-            heads=int(gat_cfg.heads),
-            dropout=float(config.model.dropout.gatv2),
-            use_residual=bool(gat_cfg.use_residual),
-        )
+        self.use_social_gat = bool(getattr(gat_cfg, "enabled", True))
+        if self.use_social_gat:
+            self.gat = GATv2Stack(
+                in_dim=int(feat_cfg.fused_dim),
+                hidden_dim=int(gat_cfg.hidden_dim),
+                num_layers=int(gat_cfg.num_layers),
+                heads=int(gat_cfg.heads),
+                dropout=float(config.model.dropout.gatv2),
+                topk_neighbors=int(getattr(gat_cfg, "topk_neighbors", 4)),
+            )
+            self.no_gat_proj = None
+        else:
+            self.gat = None
+            # No-GAT ablation: keep per-person projection only, without inter-person message passing.
+            self.no_gat_proj = nn.Sequential(
+                nn.Linear(int(feat_cfg.fused_dim), int(gat_cfg.hidden_dim)),
+                nn.ReLU(inplace=True),
+                nn.Dropout(float(config.model.dropout.gatv2)),
+            )
 
         self.temporal_encoder = TemporalEncoder(
             d_model=int(tmp_cfg.d_model),
@@ -154,22 +161,9 @@ class ImportanceRanker(nn.Module):
             dropout=float(config.model.dropout.temporal),
         )
 
-        agg_heads = int(getattr(tmp_cfg, "agg_heads", 8))
         agg_out = int(getattr(tmp_cfg, "agg_out_dim", int(tmp_cfg.d_model)))
-        use_video_transformer = bool(getattr(tmp_cfg, "use_video_transformer", False))
-        transformer_layers = int(getattr(tmp_cfg, "transformer_layers", 0))
-        pooling_cfg = getattr(tmp_cfg, "pooling", None)
-        pooling = str(pooling_cfg)
-        self.temporal_agg = VideoLevelAggregator(
-            input_dim=int(tmp_cfg.d_model),
-            out_dim=agg_out,
-            num_heads=agg_heads,
-            dropout=float(config.model.dropout.temporal),
-            use_video_transformer=use_video_transformer,
-            pooling=pooling,
-            transformer_layers=max(1, transformer_layers) if use_video_transformer else 1,
-        )
         agg_out_dim = int(agg_out)
+        self.rel_feature_dim = agg_out_dim
 
         self.use_event_token = bool(getattr(tmp_cfg, "use_event_token", True))
         event_layers = int(getattr(tmp_cfg, "event_num_layers", 1))
@@ -184,10 +178,6 @@ class ImportanceRanker(nn.Module):
 
         self.to_dmodel = nn.Linear(int(gat_cfg.hidden_dim), int(tmp_cfg.d_model))
 
-        # Keep self branch independent from graph-enhanced relation features.
-        self.dual_head = bool(getattr(config.training, "enable_dual_head", False))
-        if not self.dual_head:
-            raise ValueError("config.training.enable_dual_head must be True to keep self/rel paths disentangled")
         self.self_temporal_attn = nn.Sequential(
             nn.LayerNorm(int(feat_cfg.fused_dim)),
             nn.Linear(int(feat_cfg.fused_dim), 1),
@@ -199,39 +189,29 @@ class ImportanceRanker(nn.Module):
             nn.Linear(int(sc_cfg.hidden_dim), 1),
         )
 
-        fusion_dim = int(getattr(fusion_cfg, "feature_dim", int(agg_out_dim)))
-        if fusion_dim <= 0:
-            raise ValueError(f"fusion.feature_dim must be > 0, got {fusion_dim}")
-
-        self.self_feature_proj = nn.Linear(int(feat_cfg.fused_dim), fusion_dim)
-        self.rel_feature_proj = nn.Linear(int(agg_out_dim), fusion_dim)
-        self.cf_feature_proj = nn.Linear(int(agg_out_dim), fusion_dim)
-
-        fusion_heads = int(getattr(fusion_cfg, "interaction_heads", 8))
-        if fusion_dim % max(1, fusion_heads) != 0:
-            raise ValueError(
-                f"fusion.feature_dim ({fusion_dim}) must be divisible by fusion.interaction_heads ({fusion_heads})"
-            )
-        fusion_layers = max(1, int(getattr(fusion_cfg, "interaction_layers", 1)))
-        fusion_dropout = float(getattr(fusion_cfg, "dropout", 0.1))
-
-        fusion_layer = nn.TransformerEncoderLayer(
-            d_model=fusion_dim,
-            nhead=fusion_heads,
-            dim_feedforward=max(2 * fusion_dim, 512),
-            dropout=fusion_dropout,
-            batch_first=True,
-            activation="gelu",
-            norm_first=False,
-        )
-        self.feature_interaction = nn.TransformerEncoder(fusion_layer, num_layers=fusion_layers)
-        self.feature_pool = nn.Linear(fusion_dim, 1)
-        self.final_scoring = nn.Sequential(
-            nn.Linear(fusion_dim, int(sc_cfg.hidden_dim)),
+        # Additive scoring: self is the base signal, rel/cf provide explicit increments.
+        self.rel_scoring = nn.Sequential(
+            nn.LayerNorm(agg_out_dim),
+            nn.Linear(agg_out_dim, int(sc_cfg.hidden_dim)),
             nn.ReLU(inplace=True),
             nn.Dropout(float(config.model.dropout.scoring)),
             nn.Linear(int(sc_cfg.hidden_dim), 1),
         )
+        self.cf_scoring = nn.Sequential(
+            nn.LayerNorm(agg_out_dim),
+            nn.Linear(agg_out_dim, int(sc_cfg.hidden_dim)),
+            nn.ReLU(inplace=True),
+            nn.Dropout(float(config.model.dropout.scoring)),
+            nn.Linear(int(sc_cfg.hidden_dim), 1),
+        )
+        self.normalize_branch_logits = bool(getattr(sc_cfg, "normalize_branch_logits", True))
+        self.branch_gain_floor = float(getattr(sc_cfg, "gain_floor", 0.05))
+        self.use_confidence_gate = bool(getattr(sc_cfg, "use_confidence_gate", True))
+        self.confidence_gate_floor = float(getattr(sc_cfg, "confidence_gate_floor", 0.05))
+
+        self._self_gain_param = nn.Parameter(self._inv_softplus(1.0 - self.branch_gain_floor))
+        self._rel_gain_param = nn.Parameter(self._inv_softplus(1.0 - self.branch_gain_floor))
+        self._cf_gain_param = nn.Parameter(self._inv_softplus(1.0 - self.branch_gain_floor))
 
         if self.use_relation_branch:
             self.relation_reasoner = RelationReasoner(
@@ -249,12 +229,6 @@ class ImportanceRanker(nn.Module):
                 dropout=float(cf_cfg.dropout),
             )
 
-        self.branch_names = ["self"]
-        if self.use_relation_branch:
-            self.branch_names.append("rel")
-        if self.use_counterfactual_branch:
-            self.branch_names.append("counterfactual")
-
         self.activation_checkpointing = bool(getattr(config.training, "activation_checkpointing", True))
 
         logger.info("Initialized ImportanceRanker (vision_dir=%s)", str(dino_cfg.model_dir))
@@ -270,6 +244,34 @@ class ImportanceRanker(nn.Module):
         weights = torch.softmax(masked, dim=dim)
         weights = weights * mask.to(dtype=weights.dtype)
         return weights / weights.sum(dim=dim, keepdim=True).clamp(min=1e-6)
+
+    @staticmethod
+    def _inv_softplus(x: float) -> torch.Tensor:
+        # Stable inverse for positive initialization values.
+        x_t = torch.tensor(float(max(x, 1e-6)), dtype=torch.float32)
+        return torch.log(torch.expm1(x_t))
+
+    def _branch_gain(self, key: str) -> torch.Tensor:
+        if key == "self":
+            p = self._self_gain_param
+        elif key == "rel":
+            p = self._rel_gain_param
+        elif key == "cf":
+            p = self._cf_gain_param
+        else:
+            raise ValueError(f"Unknown branch key: {key}")
+        return F.softplus(p) + self.branch_gain_floor
+
+    @staticmethod
+    def _normalize_logits_over_valid(logits: torch.Tensor, valid_mask: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+        mask = valid_mask.bool()
+        mask_f = mask.to(dtype=logits.dtype)
+        count = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+        mean = (logits * mask_f).sum(dim=1, keepdim=True) / count
+        centered = (logits - mean) * mask_f
+        var = (centered * centered).sum(dim=1, keepdim=True) / count
+        std = torch.sqrt(var + float(eps))
+        return (centered / std) * mask_f
 
     def forward(
         self,
@@ -308,7 +310,12 @@ class ImportanceRanker(nn.Module):
 
         fused = self.fuse(torch.cat([vis_feats, geom_feats], dim=-1)).masked_fill(~pm.unsqueeze(-1), 0.0)
 
-        social = self.gat(fused, pm)
+        if self.use_social_gat:
+            assert self.gat is not None
+            social = self.gat(fused, pm, bboxes=bboxes)
+        else:
+            assert self.no_gat_proj is not None
+            social = self.no_gat_proj(fused).masked_fill(~pm.unsqueeze(-1), 0.0)
 
         # Transformer 的时间 mask 是“该 person 在该帧是否有效”
         pm_bt = pm.permute(0, 2, 1).reshape(B * N, T)
@@ -322,85 +329,95 @@ class ImportanceRanker(nn.Module):
         if self.use_event_token:
             rel_tokens = self._maybe_checkpoint(self.event_ctx, rel_tokens, pm).masked_fill(~pm.unsqueeze(-1), 0.0)
 
-        rel_pooled = self._maybe_checkpoint(self.temporal_agg, rel_tokens, pm)  # (B,N,D)
-
         valid_mask = pm.any(dim=1)
 
         if self.use_relation_branch:
             relation_out = self.relation_reasoner(rel_tokens, pm)
-            rel_features = rel_pooled + relation_out["relation_features"]
-            rel_logits = relation_out["relation_logits"]
+            rel_features = relation_out["relation_features"]
+            rel_logits_raw = self.rel_scoring(rel_features).squeeze(-1)
         else:
             relation_out = None
-            rel_features = rel_pooled
-            rel_logits = rel_pooled.new_zeros((B, N))
+            rel_features = fused.new_zeros((B, N, self.rel_feature_dim))
+            rel_logits_raw = fused.new_zeros((B, N))
 
-        self_attn_logits = self.self_temporal_attn(fused).squeeze(-1)
-        self_attn = self._masked_softmax(self_attn_logits, pm, dim=1)
-        self_pooled = (fused * self_attn.unsqueeze(-1)).sum(dim=1)
-        self_logits = self.self_scoring(self_pooled).squeeze(-1)
-        self_logits = self_logits.masked_fill(~valid_mask, -1e4)
+        if self.use_self_branch:
+            self_attn_logits = self.self_temporal_attn(fused).squeeze(-1)
+            self_attn = self._masked_softmax(self_attn_logits, pm, dim=1)
+            self_pooled = (fused * self_attn.unsqueeze(-1)).sum(dim=1)
+            self_logits_raw = self.self_scoring(self_pooled).squeeze(-1)
+        else:
+            self_attn = pm.new_zeros(pm.shape, dtype=fused.dtype)
+            self_logits_raw = fused.new_zeros((B, N))
 
         if self.use_counterfactual_branch:
             cf_out = self.counterfactual_reasoner(rel_tokens, pm)
-            counterfactual_logits = cf_out["counterfactual_logits"]
+            counterfactual_logits_raw = self.cf_scoring(cf_out["counterfactual_features"]).squeeze(-1)
             counterfactual_delta = cf_out["counterfactual_delta"]
             event_state = cf_out["event_state"]
         else:
             cf_out = None
-            counterfactual_logits = None
+            counterfactual_logits_raw = fused.new_zeros((B, N))
             counterfactual_delta = None
             event_state = None
 
-        branch_features = [self.self_feature_proj(self_pooled)]
-        branch_names = ["self"]
+        if self.normalize_branch_logits:
+            self_logits_norm = self._normalize_logits_over_valid(self_logits_raw, valid_mask)
+            rel_logits_norm = self._normalize_logits_over_valid(rel_logits_raw, valid_mask)
+            cf_logits_norm = self._normalize_logits_over_valid(counterfactual_logits_raw, valid_mask)
+        else:
+            mask_f = valid_mask.to(dtype=self_logits_raw.dtype)
+            self_logits_norm = self_logits_raw * mask_f
+            rel_logits_norm = rel_logits_raw * mask_f
+            cf_logits_norm = counterfactual_logits_raw * mask_f
 
-        if self.use_relation_branch:
-            branch_features.append(self.rel_feature_proj(rel_features))
-            branch_names.append("rel")
+        self_gain = self._branch_gain("self")
+        rel_gain = self._branch_gain("rel")
+        cf_gain = self._branch_gain("cf")
 
-        if self.use_counterfactual_branch and cf_out is not None:
-            branch_features.append(self.cf_feature_proj(cf_out["counterfactual_features"]))
-            branch_names.append("counterfactual")
+        self_logits = self_logits_norm * self_gain if self.use_self_branch else self_logits_norm
+        rel_logits = rel_logits_norm * rel_gain if self.use_relation_branch else rel_logits_norm
+        counterfactual_logits = cf_logits_norm * cf_gain if self.use_counterfactual_branch else cf_logits_norm
 
-        branch_stack = torch.stack(branch_features, dim=2)  # (B,N,M,D)
-        branch_mask = valid_mask.unsqueeze(-1).unsqueeze(-1).to(dtype=branch_stack.dtype)
-        branch_stack = branch_stack * branch_mask
+        branch_gate = self_logits.new_ones((B, 1))
+        if self.use_confidence_gate and self.use_self_branch:
+            self_for_conf = self_logits.masked_fill(~valid_mask, -1e4)
+            self_prob = torch.softmax(self_for_conf / float(self.config.model.scoring.temperature), dim=1)
+            self_conf = self_prob.max(dim=1, keepdim=True).values
+            branch_gate = (1.0 - self_conf).clamp(min=self.confidence_gate_floor, max=1.0)
+            if self.use_relation_branch:
+                rel_logits = rel_logits * branch_gate
+            if self.use_counterfactual_branch:
+                counterfactual_logits = counterfactual_logits * branch_gate
 
-        M = int(branch_stack.shape[2])
-        D = int(branch_stack.shape[3])
-        branch_tokens = branch_stack.reshape(B * N, M, D)
-        branch_tokens = self.feature_interaction(branch_tokens)
-
-        pool_logits = self.feature_pool(branch_tokens).squeeze(-1)  # (B*N, M)
-        pool_weights = torch.softmax(pool_logits, dim=1)
-        fused_features = (branch_tokens * pool_weights.unsqueeze(-1)).sum(dim=1)
-        fused_features = fused_features.reshape(B, N, D)
-
-        logits = self.final_scoring(fused_features).squeeze(-1)
+        # Final score is explicit base + increments.
+        logits = self_logits + rel_logits
+        if self.use_counterfactual_branch:
+            logits = logits + counterfactual_logits
         logits = logits.masked_fill(~valid_mask, -1e4)
-
-        branch_weight_tensor = pool_weights.reshape(B, N, M) * valid_mask.unsqueeze(-1).to(dtype=pool_weights.dtype)
-        branch_weight_tensor = branch_weight_tensor / branch_weight_tensor.sum(dim=-1, keepdim=True).clamp(min=1e-6)
 
         scores = torch.softmax(logits / float(self.config.model.scoring.temperature), dim=1) * valid_mask.float()
 
         out = {
             "importance_logits": logits,
             "importance_scores": scores,
-            "video_features": fused_features,
-            "branch_weights": branch_weight_tensor,
-            "branch_weight_names": branch_names,
+            "video_features": rel_features,
         }
 
-        out["importance_logits_self"] = self_logits
+        out["importance_logits_self"] = self_logits.masked_fill(~valid_mask, -1e4)
+        out["importance_logits_self_raw"] = self_logits_raw.masked_fill(~valid_mask, -1e4)
         out["self_attention"] = self_attn
-        out["importance_logits_rel"] = rel_logits
+        out["importance_logits_rel"] = rel_logits.masked_fill(~valid_mask, -1e4)
+        out["importance_logits_rel_raw"] = rel_logits_raw.masked_fill(~valid_mask, -1e4)
+        out["branch_gain_self"] = self_gain
+        out["branch_gain_rel"] = rel_gain
+        out["branch_gain_cf"] = cf_gain
+        out["branch_confidence_gate"] = branch_gate
         out["relation_features"] = rel_features
         if relation_out is not None:
             out["relation_attention"] = relation_out["relation_attention"]
         if cf_out is not None:
-            out["importance_logits_counterfactual"] = counterfactual_logits
+            out["importance_logits_counterfactual"] = counterfactual_logits.masked_fill(~valid_mask, -1e4)
+            out["importance_logits_counterfactual_raw"] = counterfactual_logits_raw.masked_fill(~valid_mask, -1e4)
             out["counterfactual_delta"] = counterfactual_delta
             out["event_state"] = event_state
         return out
