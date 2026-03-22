@@ -112,7 +112,7 @@ class MemoryEfficientTrainer:
                 out[k] = v
                 continue
 
-            if k in {"frames", "bboxes", "person_mask", "target_index"}:
+            if k in {"frames", "bboxes", "person_mask", "target_index", "scene_category_idx"}:
                 out[k] = v.to(self.device, non_blocking=True)
             else:
                 out[k] = v
@@ -246,32 +246,8 @@ class MemoryEfficientTrainer:
                         "epoch": epoch,
                         "train_self_logit_abs": float(train_diag.get("train_self_logit_abs", 0.0)),
                         "train_rel_logit_abs": float(train_diag.get("train_rel_logit_abs", 0.0)),
-                        "train_cf_logit_abs": float(train_diag.get("train_cf_logit_abs", 0.0)),
-                        "train_rel_self_ratio": float(train_diag.get("train_rel_self_ratio", 0.0)),
-                        "train_cf_self_ratio": float(train_diag.get("train_cf_self_ratio", 0.0)),
-                        "train_gain_self": float(train_diag.get("train_gain_self", 0.0)),
-                        "train_gain_rel": float(train_diag.get("train_gain_rel", 0.0)),
-                        "train_gain_cf": float(train_diag.get("train_gain_cf", 0.0)),
-                        "train_branch_confidence_gate": float(train_diag.get("train_branch_confidence_gate", 0.0)),
-                        "train_relation_residual_loss": float(train_diag.get("train_relation_residual_loss", 0.0)),
-                        "train_counterfactual_residual_loss": float(train_diag.get("train_counterfactual_residual_loss", 0.0)),
-                        "train_cf_effect_loss": float(train_diag.get("train_cf_effect_loss", 0.0)),
-                        "grad_rel_scoring_l2": float(train_diag.get("grad_rel_scoring_l2", 0.0)),
-                        "grad_cf_scoring_l2": float(train_diag.get("grad_cf_scoring_l2", 0.0)),
-                        "grad_relation_reasoner_l2": float(train_diag.get("grad_relation_reasoner_l2", 0.0)),
-                        "grad_counterfactual_reasoner_l2": float(train_diag.get("grad_counterfactual_reasoner_l2", 0.0)),
                         "val_self_logit_abs": float(val_diag.get("val_self_logit_abs", 0.0)),
                         "val_rel_logit_abs": float(val_diag.get("val_rel_logit_abs", 0.0)),
-                        "val_cf_logit_abs": float(val_diag.get("val_cf_logit_abs", 0.0)),
-                        "val_rel_self_ratio": float(val_diag.get("val_rel_self_ratio", 0.0)),
-                        "val_cf_self_ratio": float(val_diag.get("val_cf_self_ratio", 0.0)),
-                        "val_gain_self": float(val_diag.get("val_gain_self", 0.0)),
-                        "val_gain_rel": float(val_diag.get("val_gain_rel", 0.0)),
-                        "val_gain_cf": float(val_diag.get("val_gain_cf", 0.0)),
-                        "val_branch_confidence_gate": float(val_diag.get("val_branch_confidence_gate", 0.0)),
-                        "val_relation_residual_loss": float(val_diag.get("val_relation_residual_loss", 0.0)),
-                        "val_counterfactual_residual_loss": float(val_diag.get("val_counterfactual_residual_loss", 0.0)),
-                        "val_cf_effect_loss": float(val_diag.get("val_cf_effect_loss", 0.0)),
                     }
                 )
 
@@ -337,33 +313,19 @@ class MemoryEfficientTrainer:
                     "Epoch %d: train_acc=%.4f train_loss=%.4f (imp=%.4f pref=%.4f) "
                     "val_acc=%.4f val_loss=%.4f (imp=%.4f pref=%.4f) "
                     "rank1=%.2f%% rank2=%.2f%% rank3=%.2f%% "
-                    "branch_abs(train self=%.3f rel=%.3f cf=%.3f; val self=%.3f rel=%.3f cf=%.3f) "
-                    "grad_l2(rel=%.3f cf=%.3f rel_reasoner=%.3f cf_reasoner=%.3f) "
-                    "lr=%.6f group_lrs=[%s] dt=%.1fs",
+                    "logit_abs(train s=%.3f r=%.3f; val s=%.3f r=%.3f) "
+                    "lr=%.6f dt=%.1fs",
                     int(epoch),
-                    float(train_acc),
-                    float(train_loss),
-                    float(train_imp_loss),
-                    float(train_pref_loss),
-                    float(val_acc),
-                    float(val_loss),
-                    float(val_imp_loss),
-                    float(val_pref_loss),
-                    float(r1),
-                    float(r2),
-                    float(r3),
+                    float(train_acc), float(train_loss),
+                    float(train_imp_loss), float(train_pref_loss),
+                    float(val_acc), float(val_loss),
+                    float(val_imp_loss), float(val_pref_loss),
+                    float(r1), float(r2), float(r3),
                     float(train_diag.get("train_self_logit_abs", 0.0)),
                     float(train_diag.get("train_rel_logit_abs", 0.0)),
-                    float(train_diag.get("train_cf_logit_abs", 0.0)),
                     float(val_diag.get("val_self_logit_abs", 0.0)),
                     float(val_diag.get("val_rel_logit_abs", 0.0)),
-                    float(val_diag.get("val_cf_logit_abs", 0.0)),
-                    float(train_diag.get("grad_rel_scoring_l2", 0.0)),
-                    float(train_diag.get("grad_cf_scoring_l2", 0.0)),
-                    float(train_diag.get("grad_relation_reasoner_l2", 0.0)),
-                    float(train_diag.get("grad_counterfactual_reasoner_l2", 0.0)),
                     float(self.config.training.learning_rate),
-                    group_lr_str,
                     float(epoch_dt),
                 )
 

@@ -1,10 +1,4 @@
-"""Configuration management (minimal core + preserved training shell).
-
-Notes
-- This is intentionally compatible with the existing training runtime/trainer utilities.
-- We keep a stable config surface for logging/visualization/training, while the model core
-    switches to a minimal DINOv2 (local HF) + GATv2 + Transformer + ranking-loss formulation.
-"""
+"""Configuration management."""
 
 from __future__ import annotations
 
@@ -15,11 +9,10 @@ from typing import Optional
 @dataclass
 class DataConfig:
     data_dir: str = "data/shared_data/preprocessed_fixed"
-    # train_splits: list[str] = field(default_factory=lambda: ["train", "test"])
-    train_splits: list[str] = field(default_factory=lambda: ["train"])
+    train_splits: list[str] = field(default_factory=lambda: ["train", "test"])
+    # train_splits: list[str] = field(default_factory=lambda: ["train"])
     val_split: str = "val"
     video_length: int = 120
-    # video_length: int = 96
     max_persons: int = 16
     cache_data: bool = False
     max_samples: Optional[int] = None
@@ -29,16 +22,17 @@ class DataConfig:
 @dataclass
 class DropoutConfig:
     features: float = 0.10
-    gatv2: float = 0.10
+    gatv2: float = 0.20
     temporal: float = 0.20
     scoring: float = 0.20
-    gate: float = 0.20
 
 
 @dataclass
 class BBoxGeomConfig:
-    feature_dim: int = 256
-    hidden_dim: int = 512
+    feature_dim: int = 128
+    hidden_dim: int = 128
+    spatial_edge_dim: int = 32
+    temporal_edge_dim: int = 16
 
 
 @dataclass
@@ -65,27 +59,13 @@ class GATv2Config:
     num_layers: int = 2
     heads: int = 4
     topk_neighbors: int = 4
-
-
-@dataclass
-class TemporalTransformerConfig:
-    d_model: int = 768
-    nhead: int = 12
-    num_layers: int = 2
-    dim_feedforward: int = 1024
-    use_event_token: bool = True
-    event_num_layers: int = 1
-    agg_out_dim: int = 512
+    temporal_window: int = 3
 
 
 @dataclass
 class ScoringConfig:
     hidden_dim: int = 256
     temperature: float = 1.0
-    normalize_branch_logits: bool = True
-    gain_floor: float = 0.05
-    use_confidence_gate: bool = True
-    confidence_gate_floor: float = 0.05
 
 
 @dataclass
@@ -96,15 +76,6 @@ class SelfBranchConfig:
 @dataclass
 class RelationConfig:
     enabled: bool = True
-    hidden_dim: int = 256
-    dropout: float = 0.1
-
-
-@dataclass
-class CounterfactualConfig:
-    enabled: bool = True
-    hidden_dim: int = 256
-    dropout: float = 0.1
 
 
 @dataclass
@@ -112,10 +83,6 @@ class LossConfig:
     beta: float = 1.0
     importance_weight: float = 1.0
     preference_weight: float = 0.0
-    counterfactual_effect_weight: float = 0.30
-    counterfactual_margin: float = 0.10
-    relation_residual_weight: float = 1.0
-    counterfactual_residual_weight: float = 1.0
 
 
 @dataclass
@@ -123,11 +90,9 @@ class ModelConfig:
     dropout: DropoutConfig = field(default_factory=DropoutConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
     gatv2: GATv2Config = field(default_factory=GATv2Config)
-    temporal: TemporalTransformerConfig = field(default_factory=TemporalTransformerConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
     self_branch: SelfBranchConfig = field(default_factory=SelfBranchConfig)
     relation: RelationConfig = field(default_factory=RelationConfig)
-    counterfactual: CounterfactualConfig = field(default_factory=CounterfactualConfig)
     loss: LossConfig = field(default_factory=LossConfig)
 
 
@@ -140,12 +105,12 @@ class TrainingConfig:
 
     num_epochs: int = 15
     batch_size: int = 16
-    accumulation_steps: int = 8
-    roi_chunk: int = 128
+    accumulation_steps: int = 4
+    roi_chunk: int = 512
     export_train_predictions: bool = False
 
     use_mixed_precision: bool = True
-    activation_checkpointing: bool = True
+    activation_checkpointing: bool = False
     max_grad_norm: float = 3.0
 
     distributed: bool = False

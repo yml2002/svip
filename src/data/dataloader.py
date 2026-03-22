@@ -224,4 +224,5 @@ class MSGVIPDataset(Dataset):
             "target_index": torch.tensor(int(target_index_int), dtype=torch.int64),
             "video_id": video_id,
             "scene_category": scene_category,
+            "scene_category_idx": torch.tensor(int(scene_category) - 1, dtype=torch.int64),
         }

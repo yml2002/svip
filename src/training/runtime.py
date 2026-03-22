@@ -219,28 +219,6 @@ class TrainingRuntime:
             config.model.loss.importance_weight = float(self.args.importance_weight)
         if getattr(self.args, "preference_weight", None) is not None:
             config.model.loss.preference_weight = float(self.args.preference_weight)
-        if getattr(self.args, "counterfactual_effect_weight", None) is not None:
-            config.model.loss.counterfactual_effect_weight = float(self.args.counterfactual_effect_weight)
-        if getattr(self.args, "counterfactual_margin", None) is not None:
-            config.model.loss.counterfactual_margin = float(self.args.counterfactual_margin)
-        if getattr(self.args, "relation_residual_weight", None) is not None:
-            config.model.loss.relation_residual_weight = float(self.args.relation_residual_weight)
-        if getattr(self.args, "counterfactual_residual_weight", None) is not None:
-            config.model.loss.counterfactual_residual_weight = float(self.args.counterfactual_residual_weight)
-        if getattr(self.args, "branch_gain_floor", None) is not None:
-            gain_floor = float(self.args.branch_gain_floor)
-            if gain_floor < 0.0:
-                raise ValueError(f"branch_gain_floor must be >= 0, got {gain_floor}")
-            config.model.scoring.gain_floor = gain_floor
-        if getattr(self.args, "confidence_gate_floor", None) is not None:
-            gate_floor = float(self.args.confidence_gate_floor)
-            if gate_floor < 0.0 or gate_floor > 1.0:
-                raise ValueError(f"confidence_gate_floor must be in [0,1], got {gate_floor}")
-            config.model.scoring.confidence_gate_floor = gate_floor
-        if bool(getattr(self.args, "disable_branch_logit_norm", False)):
-            config.model.scoring.normalize_branch_logits = False
-        if bool(getattr(self.args, "disable_confidence_gate", False)):
-            config.model.scoring.use_confidence_gate = False
         if bool(getattr(self.args, "no_gat", False)):
             config.model.gatv2.enabled = False
         if getattr(self.args, "gat_topk_neighbors", None) is not None:
@@ -248,14 +226,10 @@ class TrainingRuntime:
             if topk < 0:
                 raise ValueError(f"gat_topk_neighbors must be >= 0, got {topk}")
             config.model.gatv2.topk_neighbors = topk
-        if getattr(self.args, "use_event_token", None) is not None:
-            config.model.temporal.use_event_token = bool(int(self.args.use_event_token))
         if getattr(self.args, "self_enabled", None) is not None:
             config.model.self_branch.enabled = bool(int(self.args.self_enabled))
         if getattr(self.args, "relation_enabled", None) is not None:
             config.model.relation.enabled = bool(int(self.args.relation_enabled))
-        if getattr(self.args, "counterfactual_enabled", None) is not None:
-            config.model.counterfactual.enabled = bool(int(self.args.counterfactual_enabled))
 
         if getattr(self.args, "logit_temperature", None) is not None:
             config.model.scoring.temperature = float(self.args.logit_temperature)
