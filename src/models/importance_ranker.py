@@ -123,6 +123,7 @@ class ImportanceRanker(nn.Module):
                     temporal_edge_dim=int(getattr(geom_cfg, "temporal_edge_dim", 16)),
                     use_temporal_edges=bool(getattr(gat_cfg, "use_temporal_edges", True)),
                     use_edge_features=bool(getattr(gat_cfg, "use_edge_features", True)),
+                    graph_type=str(getattr(gat_cfg, "graph_type", "gatv2")),
                 )
             else:
                 self.gat = None

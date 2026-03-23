@@ -16,7 +16,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv
+from torch_geometric.nn import GATv2Conv, GCNConv
 
 from src.models.bbox_geom import (
     compute_spatial_edge_features_from_bboxes,
@@ -57,6 +57,7 @@ class SpatioTemporalGATv2(nn.Module):
         temporal_edge_dim: int = 16,
         use_temporal_edges: bool = True,
         use_edge_features: bool = True,
+        graph_type: str = "gatv2",
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -66,12 +67,13 @@ class SpatioTemporalGATv2(nn.Module):
         self.dropout = float(dropout)
         self.use_temporal_edges = bool(use_temporal_edges)
         self.use_edge_features = bool(use_edge_features)
+        self.graph_type = str(graph_type)
 
         self.in_proj = nn.Linear(in_dim, hidden_dim) if in_dim != hidden_dim else nn.Identity()
 
-        # Edge feature projections (only if edge features enabled)
-        edge_dim = int(spatial_edge_dim) if self.use_edge_features else None
-        if self.use_edge_features:
+        # Edge feature projections (only if edge features enabled AND gatv2)
+        edge_dim = int(spatial_edge_dim) if (self.use_edge_features and self.graph_type == "gatv2") else None
+        if self.use_edge_features and self.graph_type == "gatv2":
             self.spatial_edge_proj = nn.Sequential(
                 nn.Linear(SPATIAL_EDGE_RAW_DIM, int(spatial_edge_dim)),
                 nn.ReLU(inplace=True),
@@ -86,16 +88,19 @@ class SpatioTemporalGATv2(nn.Module):
 
         self.layers = nn.ModuleList()
         for _ in range(self.num_layers):
-            self.layers.append(
-                GATv2Conv(
-                    hidden_dim,
-                    hidden_dim // heads,
-                    heads=heads,
-                    dropout=dropout,
-                    add_self_loops=False,
-                    edge_dim=edge_dim,
+            if self.graph_type == "gcn":
+                self.layers.append(GCNConv(hidden_dim, hidden_dim))
+            else:
+                self.layers.append(
+                    GATv2Conv(
+                        hidden_dim,
+                        hidden_dim // heads,
+                        heads=heads,
+                        dropout=dropout,
+                        add_self_loops=False,
+                        edge_dim=edge_dim,
+                    )
                 )
-            )
 
         self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(self.num_layers)])
 
@@ -171,7 +176,7 @@ class SpatioTemporalGATv2(nn.Module):
         if spatial_src.numel() > 0:
             all_edge_src.append(spatial_src)
             all_edge_dst.append(spatial_dst)
-            if self.use_edge_features:
+            if self.spatial_edge_proj is not None:
                 s_feat_raw = compute_spatial_edge_features_from_bboxes(
                     node_bboxes[spatial_src], node_bboxes[spatial_dst]
                 )
@@ -180,7 +185,7 @@ class SpatioTemporalGATv2(nn.Module):
         if temporal_src.numel() > 0:
             all_edge_src.append(temporal_src)
             all_edge_dst.append(temporal_dst)
-            if self.use_edge_features:
+            if self.temporal_edge_proj is not None:
                 t_feat_raw = compute_temporal_edge_features_from_bboxes(
                     node_bboxes[temporal_src], node_bboxes[temporal_dst]
                 )
@@ -196,11 +201,14 @@ class SpatioTemporalGATv2(nn.Module):
             edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
             edge_attr = None
 
-        # --- GATv2 message passing ---
+        # --- Graph message passing ---
         hi = all_x
         for li, layer in enumerate(self.layers):
             residual = hi
-            hi = layer(hi, edge_index, edge_attr=edge_attr)
+            if self.graph_type == "gcn":
+                hi = layer(hi, edge_index)
+            else:
+                hi = layer(hi, edge_index, edge_attr=edge_attr)
             hi = F.elu(hi)
             hi = F.dropout(hi, p=self.dropout, training=self.training)
             hi = self.norms[li](hi + residual)

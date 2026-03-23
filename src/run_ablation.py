@@ -29,13 +29,15 @@ from pathlib import Path
 ABLATION_CONFIGS = {
     "full": {},
     "self_only": {"--relation_enabled": "0"},
+    "rel_only": {"--self_enabled": "0"},
     "no_gat": {"--no_gat": None},
+    "gcn": {"--graph_type": "gcn"},
     "no_temporal": {"--no_temporal_edges": None},
     "no_edge_feat": {"--no_edge_features": None},
     "no_geom": {"--no_geom": None},
 }
 
-ABLATION_ORDER = ["full", "self_only", "no_gat", "no_temporal", "no_edge_feat", "no_geom"]
+ABLATION_ORDER = ["full", "self_only", "rel_only", "no_gat", "gcn", "no_temporal", "no_edge_feat", "no_geom"]
 
 
 def parse_args():
@@ -48,7 +50,7 @@ def parse_args():
     parser.add_argument("--num_workers", "-w", type=int, default=8)
     parser.add_argument("--roi_chunk", type=int, default=512)
     parser.add_argument("--early_stop", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--nproc_per_node", type=int, default=1, help="Number of GPUs for DDP")
     parser.add_argument("--experiments", type=str, default=None, help="Comma-separated subset")
     parser.add_argument("--output_base", type=str, default="outputs")

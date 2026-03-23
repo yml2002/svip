@@ -227,6 +227,8 @@ class TrainingRuntime:
             config.model.gatv2.use_edge_features = False
         if bool(getattr(self.args, "no_geom", False)):
             config.model.features.bbox_geom.enabled = False
+        if getattr(self.args, "graph_type", None) is not None:
+            config.model.gatv2.graph_type = str(self.args.graph_type)
         if getattr(self.args, "gat_topk_neighbors", None) is not None:
             topk = int(self.args.gat_topk_neighbors)
             if topk < 0:

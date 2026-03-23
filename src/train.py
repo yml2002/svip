@@ -116,6 +116,7 @@ def parse_args(argv=None):
     parser.add_argument("--no_temporal_edges", action="store_true")
     parser.add_argument("--no_edge_features", action="store_true")
     parser.add_argument("--no_geom", action="store_true")
+    parser.add_argument("--graph_type", type=str, default=None, choices=["gatv2", "gcn"])
     parser.add_argument("--gat_topk_neighbors", type=int, default=None)
     parser.add_argument("--gat_num_layers", type=int, default=None)
     parser.add_argument("--gat_heads", type=int, default=None)

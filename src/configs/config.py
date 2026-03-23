@@ -56,6 +56,7 @@ class FeatureConfig:
 @dataclass
 class GATv2Config:
     enabled: bool = True
+    graph_type: str = "gatv2"  # "gatv2" or "gcn"
     hidden_dim: int = 512
     num_layers: int = 2
     heads: int = 4

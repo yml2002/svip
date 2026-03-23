@@ -41,12 +41,14 @@ from pathlib import Path
 ABLATION_CONFIGS = {
     "full":         {},
     "self_only":    {"--relation_enabled": "0"},
+    "rel_only":     {"--self_enabled": "0"},
     "no_gat":       {"--no_gat": None},
     "no_temporal":  {"--no_temporal_edges": None},
     "no_edge_feat": {"--no_edge_features": None},
     "no_geom":      {"--no_geom": None},
+    "gcn":          {"--graph_type": "gcn"},
 }
-ABLATION_ORDER = ["full", "self_only", "no_gat", "no_temporal", "no_edge_feat", "no_geom"]
+ABLATION_ORDER = ["full", "self_only", "rel_only", "no_gat", "gcn", "no_temporal", "no_edge_feat", "no_geom"]
 
 # ============================================================
 # Multi-seed: full model × 3 seeds
@@ -104,7 +106,7 @@ def parse_args():
     p.add_argument("--num_workers", "-w", type=int, default=8)
     p.add_argument("--roi_chunk", type=int, default=512)
     p.add_argument("--early_stop", type=int, default=3)
-    p.add_argument("--seed", type=int, default=3407)
+    p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--seeds", type=str, default=None,
                    help="Comma-separated seeds for seed mode")
     p.add_argument("--nproc_per_node", type=int, default=1)
