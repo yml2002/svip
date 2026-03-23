@@ -28,13 +28,14 @@ from pathlib import Path
 
 ABLATION_CONFIGS = {
     "full": {},
+    "self_only": {"--relation_enabled": "0"},
     "no_gat": {"--no_gat": None},
-    "self_only": {
-        "--relation_enabled": "0",
-    },
+    "no_temporal": {"--no_temporal_edges": None},
+    "no_edge_feat": {"--no_edge_features": None},
+    "no_geom": {"--no_geom": None},
 }
 
-ABLATION_ORDER = ["full", "self_only", "no_gat"]
+ABLATION_ORDER = ["full", "self_only", "no_gat", "no_temporal", "no_edge_feat", "no_geom"]
 
 
 def parse_args():

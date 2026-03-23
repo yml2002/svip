@@ -29,6 +29,7 @@ class DropoutConfig:
 
 @dataclass
 class BBoxGeomConfig:
+    enabled: bool = True
     feature_dim: int = 128
     hidden_dim: int = 128
     spatial_edge_dim: int = 32
@@ -60,6 +61,8 @@ class GATv2Config:
     heads: int = 4
     topk_neighbors: int = 4
     temporal_window: int = 3
+    use_temporal_edges: bool = True
+    use_edge_features: bool = True
 
 
 @dataclass

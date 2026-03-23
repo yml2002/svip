@@ -76,6 +76,7 @@ class ImportanceRanker(nn.Module):
 
         self.use_self_branch = bool(getattr(config.model.self_branch, "enabled", True))
         self.use_relation_branch = bool(getattr(config.model.relation, "enabled", True))
+        self.use_geom = bool(getattr(geom_cfg, "enabled", True))
 
         # --- Feature extraction (shared backbone) ---
         self.vision = VisionEncoder(
@@ -86,9 +87,9 @@ class ImportanceRanker(nn.Module):
             unfreeze_layers=int(dino_cfg.unfreeze_layers),
         )
 
-        self.geom = BBoxGeomEncoder(out_dim=int(geom_cfg.feature_dim), hidden_dim=int(geom_cfg.hidden_dim))
+        self.geom = BBoxGeomEncoder(out_dim=int(geom_cfg.feature_dim), hidden_dim=int(geom_cfg.hidden_dim)) if self.use_geom else None
 
-        fused_in = int(dino_cfg.feature_dim) + int(geom_cfg.feature_dim)
+        fused_in = int(dino_cfg.feature_dim) + (int(geom_cfg.feature_dim) if self.use_geom else 0)
         self.fuse = nn.Sequential(
             nn.Linear(fused_in, int(feat_cfg.fused_dim)),
             nn.LayerNorm(int(feat_cfg.fused_dim)),
@@ -120,6 +121,8 @@ class ImportanceRanker(nn.Module):
                     temporal_window=int(getattr(gat_cfg, "temporal_window", 3)),
                     spatial_edge_dim=int(getattr(geom_cfg, "spatial_edge_dim", 32)),
                     temporal_edge_dim=int(getattr(geom_cfg, "temporal_edge_dim", 16)),
+                    use_temporal_edges=bool(getattr(gat_cfg, "use_temporal_edges", True)),
+                    use_edge_features=bool(getattr(gat_cfg, "use_edge_features", True)),
                 )
             else:
                 self.gat = None
@@ -182,8 +185,11 @@ class ImportanceRanker(nn.Module):
                 vis_chunk = self.vision(crops_valid[s:e])
                 vis_feats[b_idx[s:e], t_idx[s:e], n_idx[s:e]] = vis_chunk.to(dtype=vis_feats.dtype)
 
-        geom_feats = self.geom(bboxes, pm)
-        fused = self.fuse(torch.cat([vis_feats, geom_feats], dim=-1))
+        geom_feats = self.geom(bboxes, pm) if self.geom is not None else None
+        if geom_feats is not None:
+            fused = self.fuse(torch.cat([vis_feats, geom_feats], dim=-1))
+        else:
+            fused = self.fuse(vis_feats)
         fused = fused.masked_fill(~pm.unsqueeze(-1), 0.0)
 
         valid_mask = pm.any(dim=1)

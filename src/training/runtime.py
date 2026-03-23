@@ -221,15 +221,29 @@ class TrainingRuntime:
             config.model.loss.preference_weight = float(self.args.preference_weight)
         if bool(getattr(self.args, "no_gat", False)):
             config.model.gatv2.enabled = False
+        if bool(getattr(self.args, "no_temporal_edges", False)):
+            config.model.gatv2.use_temporal_edges = False
+        if bool(getattr(self.args, "no_edge_features", False)):
+            config.model.gatv2.use_edge_features = False
+        if bool(getattr(self.args, "no_geom", False)):
+            config.model.features.bbox_geom.enabled = False
         if getattr(self.args, "gat_topk_neighbors", None) is not None:
             topk = int(self.args.gat_topk_neighbors)
             if topk < 0:
                 raise ValueError(f"gat_topk_neighbors must be >= 0, got {topk}")
             config.model.gatv2.topk_neighbors = topk
+        if getattr(self.args, "gat_num_layers", None) is not None:
+            config.model.gatv2.num_layers = int(self.args.gat_num_layers)
+        if getattr(self.args, "gat_heads", None) is not None:
+            config.model.gatv2.heads = int(self.args.gat_heads)
+        if getattr(self.args, "temporal_window", None) is not None:
+            config.model.gatv2.temporal_window = int(self.args.temporal_window)
         if getattr(self.args, "self_enabled", None) is not None:
             config.model.self_branch.enabled = bool(int(self.args.self_enabled))
         if getattr(self.args, "relation_enabled", None) is not None:
             config.model.relation.enabled = bool(int(self.args.relation_enabled))
+        if getattr(self.args, "unfreeze_layers", None) is not None:
+            config.model.features.dino.unfreeze_layers = int(self.args.unfreeze_layers)
 
         if getattr(self.args, "logit_temperature", None) is not None:
             config.model.scoring.temperature = float(self.args.logit_temperature)

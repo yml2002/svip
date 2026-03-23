@@ -58,14 +58,14 @@ class VisionEncoder(nn.Module):
         else:
             self.out_dim = self.backbone_dim
 
-        if freeze:
+        if freeze or unfreeze_layers == 0:
+            # Freeze entire backbone
             for p in self.backbone.parameters():
                 p.requires_grad = False
-        elif unfreeze_layers > 0:
-            # Freeze all parameters first
+        if not freeze and unfreeze_layers > 0:
+            # Freeze all, then unfreeze the last N transformer layers
             for p in self.backbone.parameters():
                 p.requires_grad = False
-            # Unfreeze the last unfreeze_layers transformer layers
             if hasattr(self.backbone, 'encoder') and hasattr(self.backbone.encoder, 'layer'):
                 layers = self.backbone.encoder.layer
                 num_layers = len(layers)

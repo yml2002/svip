@@ -55,6 +55,8 @@ class SpatioTemporalGATv2(nn.Module):
         temporal_window: int = 1,
         spatial_edge_dim: int = 32,
         temporal_edge_dim: int = 16,
+        use_temporal_edges: bool = True,
+        use_edge_features: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -62,19 +64,25 @@ class SpatioTemporalGATv2(nn.Module):
         self.topk_neighbors = int(max(0, topk_neighbors))
         self.temporal_window = int(max(1, temporal_window))
         self.dropout = float(dropout)
+        self.use_temporal_edges = bool(use_temporal_edges)
+        self.use_edge_features = bool(use_edge_features)
 
         self.in_proj = nn.Linear(in_dim, hidden_dim) if in_dim != hidden_dim else nn.Identity()
 
-        # Edge feature projections: both types → same edge_dim for GATv2
-        edge_dim = int(spatial_edge_dim)
-        self.spatial_edge_proj = nn.Sequential(
-            nn.Linear(SPATIAL_EDGE_RAW_DIM, edge_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.temporal_edge_proj = nn.Sequential(
-            nn.Linear(TEMPORAL_EDGE_RAW_DIM, edge_dim),
-            nn.ReLU(inplace=True),
-        )
+        # Edge feature projections (only if edge features enabled)
+        edge_dim = int(spatial_edge_dim) if self.use_edge_features else None
+        if self.use_edge_features:
+            self.spatial_edge_proj = nn.Sequential(
+                nn.Linear(SPATIAL_EDGE_RAW_DIM, int(spatial_edge_dim)),
+                nn.ReLU(inplace=True),
+            )
+            self.temporal_edge_proj = nn.Sequential(
+                nn.Linear(TEMPORAL_EDGE_RAW_DIM, int(spatial_edge_dim)),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.spatial_edge_proj = None
+            self.temporal_edge_proj = None
 
         self.layers = nn.ModuleList()
         for _ in range(self.num_layers):
@@ -147,9 +155,13 @@ class SpatioTemporalGATv2(nn.Module):
         )
 
         # --- Build temporal edges (inter-frame, same person) ---
-        temporal_src, temporal_dst = self._build_temporal_edges(
-            node_b, node_t, node_n, node_indices, B, T, N, device
-        )
+        if self.use_temporal_edges:
+            temporal_src, temporal_dst = self._build_temporal_edges(
+                node_b, node_t, node_n, node_indices, B, T, N, device
+            )
+        else:
+            temporal_src = torch.empty(0, dtype=torch.long, device=device)
+            temporal_dst = torch.empty(0, dtype=torch.long, device=device)
 
         # --- Compute edge features ---
         all_edge_src = []
@@ -157,32 +169,32 @@ class SpatioTemporalGATv2(nn.Module):
         all_edge_feat = []
 
         if spatial_src.numel() > 0:
-            s_feat_raw = compute_spatial_edge_features_from_bboxes(
-                node_bboxes[spatial_src], node_bboxes[spatial_dst]
-            )
-            s_feat = self.spatial_edge_proj(s_feat_raw)
             all_edge_src.append(spatial_src)
             all_edge_dst.append(spatial_dst)
-            all_edge_feat.append(s_feat)
+            if self.use_edge_features:
+                s_feat_raw = compute_spatial_edge_features_from_bboxes(
+                    node_bboxes[spatial_src], node_bboxes[spatial_dst]
+                )
+                all_edge_feat.append(self.spatial_edge_proj(s_feat_raw))
 
         if temporal_src.numel() > 0:
-            t_feat_raw = compute_temporal_edge_features_from_bboxes(
-                node_bboxes[temporal_src], node_bboxes[temporal_dst]
-            )
-            t_feat = self.temporal_edge_proj(t_feat_raw)
             all_edge_src.append(temporal_src)
             all_edge_dst.append(temporal_dst)
-            all_edge_feat.append(t_feat)
+            if self.use_edge_features:
+                t_feat_raw = compute_temporal_edge_features_from_bboxes(
+                    node_bboxes[temporal_src], node_bboxes[temporal_dst]
+                )
+                all_edge_feat.append(self.temporal_edge_proj(t_feat_raw))
 
         if all_edge_src:
             edge_index = torch.stack([
                 torch.cat(all_edge_src),
                 torch.cat(all_edge_dst),
             ], dim=0)
-            edge_attr = torch.cat(all_edge_feat, dim=0)
+            edge_attr = torch.cat(all_edge_feat, dim=0) if all_edge_feat else None
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
-            edge_attr = torch.empty((0, self.spatial_edge_proj[0].out_features), device=device)
+            edge_attr = None
 
         # --- GATv2 message passing ---
         hi = all_x

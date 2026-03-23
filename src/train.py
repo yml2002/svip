@@ -113,14 +113,21 @@ def parse_args(argv=None):
     parser.add_argument("--preference_weight", type=float, default=None)
     # Architecture toggles
     parser.add_argument("--no_gat", action="store_true")
+    parser.add_argument("--no_temporal_edges", action="store_true")
+    parser.add_argument("--no_edge_features", action="store_true")
+    parser.add_argument("--no_geom", action="store_true")
     parser.add_argument("--gat_topk_neighbors", type=int, default=None)
+    parser.add_argument("--gat_num_layers", type=int, default=None)
+    parser.add_argument("--gat_heads", type=int, default=None)
+    parser.add_argument("--temporal_window", type=int, default=None)
     parser.add_argument("--self_enabled", type=int, choices=[0, 1], default=None)
     parser.add_argument("--relation_enabled", type=int, choices=[0, 1], default=None)
+    parser.add_argument("--unfreeze_layers", type=int, default=None)
     parser.add_argument("--logit_temperature", type=float, default=None)
 
     parser.add_argument("--swap_splits", action="store_true")
     parser.add_argument("--swap_fraction", type=float, default=0.5)
-    parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--seed", type=int, default=2026)
 
     args = parser.parse_args(argv)
     setattr(args, "_config_data_dir", str(base_config.data.data_dir))
