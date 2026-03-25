@@ -1,11 +1,4 @@
-"""Output manager.
-
-Centralizes output artifacts under a run directory:
-- records (metrics.csv/jsonl)
-- predictions (CSV per split/epoch)
-
-Trainer/loops should call into this module rather than implementing file formats.
-"""
+"""Training record writer: metrics CSV/JSONL, predictions CSV, per-class metrics."""
 
 from __future__ import annotations
 

@@ -19,16 +19,16 @@ from torch import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
-from src.training.loss import CombinedLoss
-from src.training.loops import train_epoch, validate_epoch
-from src.utils.output_manager import OutputManager
-from src.utils.visualization import save_metric_plots
+from src.engine.loss import CombinedLoss
+from src.engine.loops import train_epoch, validate_epoch
+from src.utils.records import OutputManager
+from src.utils.plots import save_metric_plots
 
 
 logger = logging.getLogger(__name__)
 
 
-class MemoryEfficientTrainer:
+class Trainer:
     def __init__(
         self,
         *,
@@ -118,43 +118,21 @@ class MemoryEfficientTrainer:
                 out[k] = v
         return out
 
-    def save_checkpoint(self, name: str = "last.pt") -> None:
-        if self.checkpoint_dir is None or not self._is_main_process():
-            return
-
-        model_ref = self.model.module if hasattr(self.model, "module") else self.model
-
-        trainable_state = {n: p.detach().cpu() for n, p in model_ref.named_parameters() if p.requires_grad}
-        payload = {
-            "epoch": self.current_epoch,
-            "global_step": self.global_step,
-            "model_trainable": trainable_state,
-            "optimizer": self.optimizer.state_dict(),
-        }
-        if self.scheduler is not None:
-            payload["scheduler"] = self.scheduler.state_dict()
-        torch.save(payload, self.checkpoint_dir / name)
-
-    def save_checkpoint_with_metrics(
+    def save_checkpoint(
         self,
-        *,
         name: str,
-        train_loss: float,
-        train_acc: float,
-        val_loss: float,
-        val_acc: float,
-        rank1: float,
-        rank2: float,
-        rank3: float,
+        *,
+        train_loss: float = 0.0,
+        train_acc: float = 0.0,
+        val_loss: float = 0.0,
+        val_acc: float = 0.0,
+        rank1: float = 0.0,
+        rank2: float = 0.0,
+        rank3: float = 0.0,
     ) -> None:
-        """Save a checkpoint plus the key epoch metrics.
-
-        We keep this separate so both `last.pt` and `best.pt` share the same payload
-        layout.
-        """
+        """Save model checkpoint with optional epoch metrics."""
         if self.checkpoint_dir is None or not self._is_main_process():
             return
-
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
         trainable_state = {n: p.detach().cpu() for n, p in model_ref.named_parameters() if p.requires_grad}
         payload: Dict[str, Any] = {
@@ -286,7 +264,7 @@ class MemoryEfficientTrainer:
 
                 # Always save latest.
                 if bool(getattr(self.config.training, "save_checkpoints", True)):
-                    self.save_checkpoint_with_metrics(
+                    self.save_checkpoint(
                         name="last.pt",
                         train_loss=float(train_loss),
                         train_acc=float(train_acc),
@@ -351,7 +329,7 @@ class MemoryEfficientTrainer:
                     best_val_acc = current_val_acc
                     best_epoch = int(epoch)
                     if bool(getattr(self.config.training, "save_checkpoints", True)):
-                        self.save_checkpoint_with_metrics(
+                        self.save_checkpoint(
                             name="best.pt",
                             train_loss=float(train_loss),
                             train_acc=float(train_acc),

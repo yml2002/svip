@@ -1,4 +1,4 @@
-"""Training loop helpers (progress bar + AMP + metrics accumulation)."""
+"""Train and validation epoch loops."""
 
 from __future__ import annotations
 
@@ -11,106 +11,14 @@ import torch.distributed as dist
 from torch import amp
 from tqdm import tqdm
 
+from src.engine.metrics import (
+    compute_accuracy_metrics,
+    compute_topk_indices,
+    compute_rankk_from_topk,
+    mean_abs_valid,
+)
+
 logger = logging.getLogger(__name__)
-
-
-def compute_accuracy_metrics(
-    importance_logits: torch.Tensor,
-    target_index: torch.Tensor,
-    person_mask: torch.Tensor,
-) -> Dict[str, int]:
-    valid_mask = person_mask.any(dim=1) if person_mask.dim() == 3 else person_mask.bool()
-    masked_logits = importance_logits.masked_fill(~valid_mask, float("-inf"))
-    pred = masked_logits.argmax(dim=1)
-    correct = int((pred == target_index).sum().item())
-    total = int(target_index.numel())
-    return {"correct_predictions": correct, "total_samples": total}
-
-
-@torch.no_grad()
-def compute_topk_indices(
-    importance_logits: torch.Tensor,
-    valid_mask: torch.Tensor,
-    k: int,
-) -> torch.Tensor:
-    mask = valid_mask.bool()
-    if mask.dim() > 2:
-        mask = mask.any(dim=1)
-    masked_logits = importance_logits.masked_fill(~mask, float("-inf"))
-    k_eff = min(int(k), int(masked_logits.shape[1]))
-    return masked_logits.topk(k=k_eff, dim=1).indices
-
-
-@torch.no_grad()
-def compute_rankk_from_topk(topk_indices: torch.Tensor, targets: torch.Tensor, k: int) -> float:
-    if topk_indices.numel() == 0:
-        return 0.0
-    tgt = targets.long()
-    hit = (topk_indices[:, :int(k)] == tgt.unsqueeze(1)).any(dim=1).float()
-    return float(hit.mean().item())
-
-
-def _mean_abs_valid(logits: torch.Tensor | None, valid_mask: torch.Tensor) -> float:
-    if logits is None:
-        return 0.0
-    mask = valid_mask.bool()
-    if mask.dim() > 2:
-        mask = mask.any(dim=1)
-    if not bool(mask.any()):
-        return 0.0
-    vals = logits.masked_select(mask)
-    if vals.numel() == 0:
-        return 0.0
-    return float(vals.abs().mean().item())
-
-
-def _mean_valid(tensor: torch.Tensor | None, valid_mask: torch.Tensor) -> float:
-    if tensor is None:
-        return 0.0
-    mask = valid_mask.bool()
-    if mask.dim() > 2:
-        mask = mask.any(dim=1)
-    if not bool(mask.any()):
-        return 0.0
-    vals = tensor.masked_select(mask)
-    if vals.numel() == 0:
-        return 0.0
-    return float(vals.mean().item())
-
-
-def _to_float_scalar(value: torch.Tensor | float | int | None) -> float:
-    if value is None:
-        return 0.0
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 0:
-            return 0.0
-        return float(value.detach().reshape(-1)[0].item())
-    return float(value)
-
-
-def export_predictions_csv(
-    *,
-    trainer,
-    split: str,
-    epoch_1based: int,
-    predicted_index: torch.Tensor,
-    targets: torch.Tensor,
-    video_ids: List[str],
-    scene_categories: List[str],
-    person_ids: List[List[int]],
-) -> None:
-    if trainer.record_logger is None or not trainer._is_main_process():
-        return
-    trainer.record_logger.export_predictions_csv(
-        split=str(split),
-        epoch=int(epoch_1based),
-        predicted_index=predicted_index,
-        targets=targets,
-        video_ids=video_ids,
-        scene_categories=scene_categories,
-        person_ids=person_ids,
-        rankk_cache=getattr(trainer, "_rankk_cache", {}) or {},
-    )
 
 
 def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, float, Dict[str, float]]:
@@ -172,8 +80,8 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
 
         pm = batch["person_mask"]
         valid_mask = pm.any(dim=1) if pm.dim() == 3 else pm
-        self_abs_sum += _mean_abs_valid(outputs.get("importance_logits_self"), valid_mask)
-        rel_abs_sum += _mean_abs_valid(outputs.get("importance_logits_rel"), valid_mask)
+        self_abs_sum += mean_abs_valid(outputs.get("importance_logits_self"), valid_mask)
+        rel_abs_sum += mean_abs_valid(outputs.get("importance_logits_rel"), valid_mask)
 
         if torch.isnan(loss):
             trainer.optimizer.zero_grad(set_to_none=True)
@@ -272,15 +180,17 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
             2: compute_rankk_from_topk(top3_all, targets_all, 2),
             3: compute_rankk_from_topk(top3_all, targets_all, 3),
         }
-        export_predictions_csv(
-            trainer=trainer, split="train",
-            epoch_1based=int(trainer.current_epoch) + 1,
-            targets=targets_all,
-            predicted_index=top3_all[:, :1].squeeze(1),
-            video_ids=pred_video_ids,
-            scene_categories=pred_scene_categories,
-            person_ids=pred_person_ids,
-        )
+        if trainer.record_logger is not None and trainer._is_main_process():
+            trainer.record_logger.export_predictions_csv(
+                split="train",
+                epoch=int(trainer.current_epoch) + 1,
+                targets=targets_all,
+                predicted_index=top3_all[:, :1].squeeze(1),
+                video_ids=pred_video_ids,
+                scene_categories=pred_scene_categories,
+                person_ids=pred_person_ids,
+                rankk_cache=getattr(trainer, "_rankk_cache", {}),
+            )
 
     avg_imp_loss = epoch_imp_loss / max(1, num_batches)
     avg_pref_loss = epoch_pref_loss / max(1, num_batches)
@@ -304,7 +214,6 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
     self_abs_sum = 0.0
     rel_abs_sum = 0.0
 
-    num_batches = 0
     running_correct = 0
     running_total = 0
 
@@ -318,7 +227,6 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
         pred_person_ids: List[List[int]] = []
 
     k_values_local: List[int] = []
-
     bucket_keys = ("k2", "k3", "k4", "k5p")
 
     is_main = trainer._is_main_process()
@@ -360,8 +268,8 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
 
         pm = batch["person_mask"]
         valid_mask = pm.any(dim=1) if pm.dim() == 3 else pm
-        self_abs_sum += _mean_abs_valid(outputs.get("importance_logits_self"), valid_mask)
-        rel_abs_sum += _mean_abs_valid(outputs.get("importance_logits_rel"), valid_mask)
+        self_abs_sum += mean_abs_valid(outputs.get("importance_logits_self"), valid_mask)
+        rel_abs_sum += mean_abs_valid(outputs.get("importance_logits_rel"), valid_mask)
 
         k_batch = valid_mask.bool().sum(dim=1).detach().long().cpu().tolist()
         k_values_local.extend(int(x) for x in k_batch)
@@ -456,16 +364,16 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
         k_values_all = k_values_local
 
     # K-bucket metrics
-    bucket_totals = {k: 0 for k in bucket_keys}
-    bucket_hits = {k: {1: 0, 2: 0, 3: 0} for k in bucket_keys}
-    targets_cpu_for_bucket = targets_all.detach().long().cpu()
-    top3_cpu_for_bucket = top3_all.detach().long().cpu()
-
     def _bucket_key(k_val: int) -> str:
         if k_val <= 2: return "k2"
         if k_val == 3: return "k3"
         if k_val == 4: return "k4"
         return "k5p"
+
+    bucket_totals = {k: 0 for k in bucket_keys}
+    bucket_hits = {k: {1: 0, 2: 0, 3: 0} for k in bucket_keys}
+    targets_cpu_for_bucket = targets_all.detach().long().cpu()
+    top3_cpu_for_bucket = top3_all.detach().long().cpu()
 
     for i in range(int(top3_cpu_for_bucket.shape[0])):
         tgt_i = int(targets_cpu_for_bucket[i].item())
@@ -501,18 +409,19 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
     rank2 = r2_ratio * 100.0
     rank3 = r3_ratio * 100.0
 
-    if collect_metadata:
-        export_predictions_csv(
-            trainer=trainer, split="val",
-            epoch_1based=int(trainer.current_epoch) + 1,
+    if collect_metadata and trainer.record_logger is not None and trainer._is_main_process():
+        trainer.record_logger.export_predictions_csv(
+            split="val",
+            epoch=int(trainer.current_epoch) + 1,
             targets=targets_all,
             predicted_index=top3_all[:, :1].squeeze(1),
             video_ids=video_ids_all,
             scene_categories=scene_all,
             person_ids=person_ids_all,
+            rankk_cache=getattr(trainer, "_rankk_cache", {}),
         )
 
-    # Classwise metrics
+    # Per-scene (classwise) metrics
     classwise: Dict[str, Dict[str, float]] = {}
     totals: Dict[str, int] = {}
     hits: Dict[str, Dict[int, int]] = {}
@@ -542,12 +451,11 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
             "total": float(total),
         }
 
-    trainer.record_logger.log_classwise_metrics(int(trainer.current_epoch) + 1, classwise)
+    if trainer.record_logger is not None:
+        trainer.record_logger.log_classwise_metrics(int(trainer.current_epoch) + 1, classwise)
     trainer._rank_by_k = rank_by_k
 
     diagnostics = {
-        "val_self_logit_abs": self_abs_sum / max(1, num_batches),
-        "val_rel_logit_abs": rel_abs_sum / max(1, num_batches),
         "val_self_logit_abs": self_abs_sum / max(1, num_batches),
         "val_rel_logit_abs": rel_abs_sum / max(1, num_batches),
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MSG_VIP Training Script
+"""Training entry point.
 
 Supports both single GPU and multi-GPU training using torchrun.
 
@@ -26,8 +26,8 @@ import torch
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.training.runtime import TrainingRuntime
-from src.configs.config import get_default_config
+from src.engine.setup import TrainingRuntime
+from src.config import get_default_config
 
 
 def setup_cuda_environment(cuda_base_path: str | None = None) -> None:
@@ -92,7 +92,7 @@ def set_global_seed(seed: int) -> None:
 
 def parse_args(argv=None):
     base_config = get_default_config()
-    parser = argparse.ArgumentParser(description="MSG_VIP Training")
+    parser = argparse.ArgumentParser(description="Person importance ranking — train")
 
     parser.add_argument("--data_dir", type=str, default=str(base_config.data.data_dir))
     parser.add_argument("--output_dir", type=str, default=str(base_config.output_dir))
@@ -113,6 +113,7 @@ def parse_args(argv=None):
     parser.add_argument("--preference_weight", type=float, default=None)
     # Architecture toggles
     parser.add_argument("--no_gat", action="store_true")
+    parser.add_argument("--no_spatial_edges", action="store_true")
     parser.add_argument("--no_temporal_edges", action="store_true")
     parser.add_argument("--no_edge_features", action="store_true")
     parser.add_argument("--no_geom", action="store_true")
@@ -126,9 +127,19 @@ def parse_args(argv=None):
     parser.add_argument("--unfreeze_layers", type=int, default=None)
     parser.add_argument("--logit_temperature", type=float, default=None)
 
+    parser.add_argument("--backbone_lr_scale", type=float, default=None,
+                        help="Backbone LR = learning_rate * this scale (default: 0.2)")
+
+    # Global context (KCGC)
+    parser.add_argument("--no_global_context", action="store_true",
+                        help="Disable Keyframe-Conditioned Global Context")
+    parser.add_argument("--global_num_keyframes", type=int, default=None,
+                        help=f"Number of keyframes for KCGC (config default: {base_config.model.global_context.num_keyframes})")
+
     parser.add_argument("--swap_splits", action="store_true")
     parser.add_argument("--swap_fraction", type=float, default=0.5)
-    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--seed", type=int, default=None,
+                        help=f"Random seed (config default: {base_config.training.seed})")
 
     args = parser.parse_args(argv)
     setattr(args, "_config_data_dir", str(base_config.data.data_dir))
@@ -176,7 +187,9 @@ def main() -> int:
         torch.distributed.init_process_group(backend="nccl")
 
     args = parse_args()
-    set_global_seed(args.seed)
+    seed = args.seed if args.seed is not None else get_default_config().training.seed
+    set_global_seed(seed)
+    args.seed = seed  # normalise so setup.py sees a concrete value
     raw_data_dir_arg = args.data_dir
     args.data_dir = resolve_data_path(args.data_dir)
     config_default_dir = getattr(args, "_config_data_dir", raw_data_dir_arg)

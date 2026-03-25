@@ -1,14 +1,20 @@
-"""Importance ranker model.
+"""Top-level person importance ranking model.
 
-Two components:
-  Self     — per-person appearance + geometry scoring (independent per person)
-  Relation — spatio-temporal graph capturing person interactions (GAT)
+Assembles all sub-modules and defines the end-to-end forward pass:
 
-Information flow:
-  frames/bboxes → DINOv2 ROI + BBoxGeom → fused features
-    → Self branch: temporal mean pool → self_scores
-    → Relation branch: spatio-temporal GAT → temporal attn pool → rel_scores
-  final = self_scores + rel_scores
+  frames / bboxes
+      → VisionEncoder (DINOv2 ROI crops)      — vis_feats        (B,T,N,D_vis)
+      → BBoxGeomEncoder (static geometry)      — geom_feats       (B,T,N,D_geom)
+      → fuse MLP                               — fused            (B,T,N,D_fused)
+      → Self branch   : temporal mean of fused → self_scores      (B,N)
+      → KCGC (optional): cross-attend fused to keyframe context
+                         → fused_ctx           (B,T,N,D_fused)
+      → Relation branch: SpatioTemporalGATv2(fused_ctx) → rel_scores (B,N)
+  logits = self_scores + rel_scores
+
+  KCGC is applied between the two branches deliberately:
+  - Self branch sees plain fused (individual appearance, no scene bias)
+  - Relation branch sees scene-enriched fused (GAT benefits from global context)
 """
 
 from __future__ import annotations
@@ -24,46 +30,14 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from src.models.bbox_geom import BBoxGeomEncoder
 from src.models.vision_encoder import VisionEncoder
 from src.models.gatv2 import SpatioTemporalGATv2
+from src.models.global_context import GlobalContextModule
+from src.models.roi import roi_crop_valid_batch
 
 logger = logging.getLogger(__name__)
 
 
-def roi_crop_valid_batch(
-    frames: torch.Tensor,
-    bboxes: torch.Tensor,
-    person_mask: torch.Tensor,
-    frame_mask: torch.Tensor,
-    out_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """ROI crop via grid_sample for valid slots only."""
-    device = frames.device
-    valid = person_mask & frame_mask.unsqueeze(-1)
-    valid_idx = valid.nonzero(as_tuple=False)
-    if valid_idx.numel() == 0:
-        return valid_idx, frames.new_zeros((0, 3, out_size, out_size))
 
-    u = torch.linspace(0, 1, out_size, device=device, dtype=frames.dtype)
-    v = torch.linspace(0, 1, out_size, device=device, dtype=frames.dtype)
-    grid_y, grid_x = torch.meshgrid(v, u, indexing="ij")
-    base = torch.stack([grid_x, grid_y], dim=-1)
-
-    b = valid_idx[:, 0]
-    t = valid_idx[:, 1]
-    n = valid_idx[:, 2]
-    boxes = bboxes[b, t, n].to(dtype=frames.dtype)
-    frames_sel = frames[b, t]
-
-    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    w = (x2 - x1).clamp(min=1e-6)
-    h = (y2 - y1).clamp(min=1e-6)
-    gx = x1[:, None, None] + base[None, :, :, 0] * w[:, None, None]
-    gy = y1[:, None, None] + base[None, :, :, 1] * h[:, None, None]
-    grid = torch.stack([gx * 2 - 1, gy * 2 - 1], dim=-1)
-    crops = F.grid_sample(frames_sel, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-    return valid_idx, crops
-
-
-class ImportanceRanker(nn.Module):
+class PersonRanker(nn.Module):
     def __init__(self, config: Any) -> None:
         super().__init__()
         self.config = config
@@ -97,7 +71,8 @@ class ImportanceRanker(nn.Module):
             nn.Dropout(float(config.model.dropout.features)),
         )
 
-        # --- Self branch ---
+
+        # --- Self branch: temporal mean of fused features ---
         if self.use_self_branch:
             self.self_scoring = nn.Sequential(
                 nn.LayerNorm(int(feat_cfg.fused_dim)),
@@ -117,10 +92,11 @@ class ImportanceRanker(nn.Module):
                     num_layers=int(gat_cfg.num_layers),
                     heads=int(gat_cfg.heads),
                     dropout=float(config.model.dropout.gatv2),
-                    topk_neighbors=int(getattr(gat_cfg, "topk_neighbors", 4)),
-                    temporal_window=int(getattr(gat_cfg, "temporal_window", 3)),
+                    topk_neighbors=int(getattr(gat_cfg, "topk_neighbors", 0)),
+                    temporal_window=int(getattr(gat_cfg, "temporal_window", 2)),
                     spatial_edge_dim=int(getattr(geom_cfg, "spatial_edge_dim", 32)),
-                    temporal_edge_dim=int(getattr(geom_cfg, "temporal_edge_dim", 16)),
+                    temporal_edge_dim=int(getattr(geom_cfg, "temporal_edge_dim", 32)),
+                    use_spatial_edges=bool(getattr(gat_cfg, "use_spatial_edges", True)),
                     use_temporal_edges=bool(getattr(gat_cfg, "use_temporal_edges", True)),
                     use_edge_features=bool(getattr(gat_cfg, "use_edge_features", True)),
                     graph_type=str(getattr(gat_cfg, "graph_type", "gatv2")),
@@ -133,8 +109,12 @@ class ImportanceRanker(nn.Module):
                     nn.Dropout(float(config.model.dropout.gatv2)),
                 )
 
+            # rel_temporal_attn: weights which frames matter for each person.
+            # Input = graph_feats + temporal_deviation (how different this frame
+            # is from the person's own average — frames with unusual behaviour
+            # should get higher attention weight).
             self.rel_temporal_attn = nn.Sequential(
-                nn.Linear(int(gat_cfg.hidden_dim), 1),
+                nn.Linear(int(gat_cfg.hidden_dim) + int(feat_cfg.fused_dim), 1),
             )
             self.rel_scoring = nn.Sequential(
                 nn.LayerNorm(int(gat_cfg.hidden_dim)),
@@ -144,13 +124,32 @@ class ImportanceRanker(nn.Module):
                 nn.Linear(int(sc_cfg.hidden_dim), 1),
             )
 
+        # --- Global Context (KCGC) ---
+        gc_cfg = config.model.global_context
+        if bool(getattr(gc_cfg, "enabled", True)):
+            # num_keyframes must stay well below sampled_frames so keyframes
+            # are spread far enough apart to carry different scene context.
+            # Rule: K = min(config value, T//4), guaranteeing gap >= 4 frames.
+            T_sampled = int(config.data.sampled_frames)
+            effective_kf = max(2, min(int(gc_cfg.num_keyframes), T_sampled // 4))
+            self.global_ctx = GlobalContextModule(
+                fused_dim=int(feat_cfg.fused_dim),
+                num_keyframes=effective_kf,
+                context_dim=int(gc_cfg.context_dim),
+                num_heads=int(gc_cfg.num_heads),
+                dropout=float(gc_cfg.dropout),
+            )
+        else:
+            self.global_ctx = None
+
         self.activation_checkpointing = bool(getattr(config.training, "activation_checkpointing", False))
         self.temperature = float(sc_cfg.temperature)
 
         branches = []
         if self.use_self_branch: branches.append("self")
         if self.use_relation_branch: branches.append("relation")
-        logger.info("Initialized ImportanceRanker: branches=%s", branches)
+        if self.global_ctx is not None: branches.append("kcgc")
+        logger.info("Initialized PersonRanker: branches=%s", branches)
 
     def _maybe_checkpoint(self, fn, *args):
         if self.training and self.activation_checkpointing:
@@ -193,24 +192,42 @@ class ImportanceRanker(nn.Module):
             fused = self.fuse(vis_feats)
         fused = fused.masked_fill(~pm.unsqueeze(-1), 0.0)
 
+
         valid_mask = pm.any(dim=1)
         mask_f = pm.to(dtype=fused.dtype).unsqueeze(-1)
 
-        # --- Self branch ---
+        # --- Self branch: temporal mean of fused (appearance + geometry) ---
+        # Uses fused before KCGC — self branch scores individual appearance,
+        # independent of scene-level context.
         if self.use_self_branch:
             self_pooled = (fused * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
             self_scores = self.self_scoring(self_pooled).squeeze(-1)
         else:
             self_scores = fused.new_zeros((B, N))
 
-        # --- Relation branch ---
+        # --- Global Context (KCGC): inject scene-level background knowledge ---
+        # Applied after self branch so only the relation branch sees scene context.
+        # DINOv2 CLS tokens of K keyframes encode objective scene semantics
+        # (what kind of scene this is), conditioning GAT on scene type.
+        if self.global_ctx is not None:
+            fused = self.global_ctx(fused, frames, self.vision, pm)
+
+        # --- Relation branch: spatio-temporal graph over KCGC-enriched features ---
         if self.use_relation_branch:
             if self.use_social_gat and self.gat is not None:
-                graph_feats = self._maybe_checkpoint(self.gat, fused, pm, bboxes)
+                graph_feats = self._maybe_checkpoint(self.gat, fused, pm, bboxes, vis_feats)
             else:
                 graph_feats = self.no_gat_proj(fused).masked_fill(~pm.unsqueeze(-1), 0.0)
 
-            attn_logits = self.rel_temporal_attn(graph_feats).squeeze(-1)
+            # Temporal deviation: how different is this frame from the person's
+            # own average across the video — captures "unusual" moments.
+            # fused_mean: (B, N, fused_dim), temporal mean per person
+            fused_mean = (fused * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
+            temporal_dev = fused - fused_mean.unsqueeze(1)  # (B, T, N, fused_dim)
+
+            # Concat graph features with temporal deviation for attention scoring
+            attn_input = torch.cat([graph_feats, temporal_dev], dim=-1)  # (B,T,N,hidden+fused)
+            attn_logits = self.rel_temporal_attn(attn_input).squeeze(-1)
             attn_logits = attn_logits.masked_fill(~pm, -1e4)
             attn_perm = attn_logits.permute(0, 2, 1)
             attn_w = torch.softmax(attn_perm, dim=-1)

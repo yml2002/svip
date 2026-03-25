@@ -1,4 +1,4 @@
-"""Data processing module for MSG_VIP.
+"""Video dataset: loads NPZ samples for person importance ranking.
 
 Loads NPZ samples with fields:
 - frames: (T,H,W,3) uint8 or float, converted to (T,3,H,W) float16 in [0,1]
@@ -8,7 +8,7 @@ Loads NPZ samples with fields:
 - target_index: scalar int64
 - video_id, scene_category
 
-This is kept compatible with the existing tests/NPZ format in the repo.
+
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from torch.utils.data import Dataset, get_worker_info
 logger = logging.getLogger(__name__)
 
 
-class MSGVIPDataset(Dataset):
+class VideoDataset(Dataset):
     def __init__(
         self,
         config: Any,
@@ -44,14 +44,14 @@ class MSGVIPDataset(Dataset):
         self.cache_data = bool(self.config.cache_data) if cache_data is None else bool(cache_data)
         self.max_samples = self.config.max_samples if max_samples is None else max_samples
 
-        self.num_frames = int(self.config.video_length)
+        self.num_frames = int(self.config.sampled_frames)   # output T after downsample
         self.num_person_slots = int(self.config.max_persons)
 
         self.file_list = self._load_file_list()
         self.data_cache = {} if self.cache_data else None
         self._resample_log_emitted = False
 
-        logger.info("Loaded %d samples from %s split", len(self.file_list), self.split)
+        logger.info("Loaded %d samples from split=%s", len(self.file_list), self.split)
 
     def _resample_temporal_arrays(
         self,
@@ -62,29 +62,39 @@ class MSGVIPDataset(Dataset):
         person_mask: np.ndarray,
         frame_mask: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Resample all time-aligned arrays to config.video_length.
+        """Extract valid frames then uniformly downsample to config.sampled_frames.
 
-        Uses deterministic uniform indexing. If source length is shorter than
-        target length, indices are repeated (upsampling by repetition).
+        Strategy:
+          1. Valid frames are always a contiguous prefix (frame_mask[0:valid_len]=True,
+             the rest are zero-padding). Extract only those valid frames.
+          2. Uniformly downsample the valid frames to sampled_frames using linspace,
+             ensuring temporal coverage is proportional to original duration.
+
+        This eliminates zero-padded tail frames and maximises inter-frame difference,
+        making temporal edge features (vis_feats diff) meaningfully non-zero.
         """
-        src_t = int(frames.shape[0])
         tgt_t = int(self.num_frames)
-        if src_t <= 0:
-            raise ValueError(f"Invalid temporal length: {src_t}")
         if tgt_t <= 0:
-            raise ValueError(f"config.video_length must be > 0, got {tgt_t}")
-        if src_t == tgt_t:
-            return frames, bboxes, person_ids, person_mask, frame_mask
+            raise ValueError(f"sampled_frames must be > 0, got {tgt_t}")
 
-        idx = np.linspace(0, src_t - 1, num=tgt_t, dtype=np.float64)
-        idx = np.clip(np.rint(idx).astype(np.int64), 0, src_t - 1)
+        # Step 1: find valid prefix length
+        valid_len = int(frame_mask.sum())
+        if valid_len == 0:
+            valid_len = int(frames.shape[0])  # fallback: treat all as valid
+
+        # Step 2: uniform downsample from valid prefix
+        idx = np.linspace(0, valid_len - 1, num=tgt_t, dtype=np.float64)
+        idx = np.clip(np.rint(idx).astype(np.int64), 0, valid_len - 1)
+
+        # All selected frames are valid by construction
+        sampled_frame_mask = np.ones(tgt_t, dtype=frame_mask.dtype)
 
         return (
             frames[idx],
             bboxes[idx],
             person_ids[idx],
             person_mask[idx],
-            frame_mask[idx],
+            sampled_frame_mask,
         )
 
     def _load_file_list(self) -> List[str]:
@@ -142,26 +152,25 @@ class MSGVIPDataset(Dataset):
         except KeyError as e:
             raise ValueError(f"Missing field in {file_path}: {e}")
 
-        if int(frames.shape[0]) != int(self.num_frames):
-            src_t = int(frames.shape[0])
-            frames, bboxes, person_ids, person_mask, frame_mask = self._resample_temporal_arrays(
-                frames=frames,
-                bboxes=bboxes,
-                person_ids=person_ids,
-                person_mask=person_mask,
-                frame_mask=frame_mask,
+        # Always: extract valid-frame prefix then uniformly downsample to sampled_frames.
+        src_t = int(frames.shape[0])
+        valid_len = int(frame_mask.sum()) if frame_mask.any() else src_t
+        frames, bboxes, person_ids, person_mask, frame_mask = self._resample_temporal_arrays(
+            frames=frames,
+            bboxes=bboxes,
+            person_ids=person_ids,
+            person_mask=person_mask,
+            frame_mask=frame_mask,
+        )
+        worker = get_worker_info()
+        is_worker0 = worker is None or int(worker.id) == 0
+        is_rank0 = int(self.local_rank) == 0
+        if not self._resample_log_emitted and self.split == "train" and is_rank0 and is_worker0:
+            logger.info(
+                "Temporal sampling: raw_T=%d  valid_T=%d  sampled_T=%d",
+                src_t, valid_len, int(self.num_frames),
             )
-            worker = get_worker_info()
-            is_worker0 = worker is None or int(worker.id) == 0
-            is_rank0 = int(self.local_rank) == 0
-            if not self._resample_log_emitted and self.split == "train" and is_rank0 and is_worker0:
-                logger.info(
-                    "Temporal resampling enabled for split=%s: source_T=%d -> target_T=%d",
-                    self.split,
-                    src_t,
-                    int(self.num_frames),
-                )
-                self._resample_log_emitted = True
+            self._resample_log_emitted = True
 
         slots = int(self.num_person_slots)
         T, n_in = int(bboxes.shape[0]), int(bboxes.shape[1])

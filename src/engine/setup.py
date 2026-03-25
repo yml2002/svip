@@ -1,18 +1,9 @@
-"""Training runtime orchestrator.
-
-Responsibilities:
-- setup distributed flags and output directories
-- load config and apply CLI overrides
-- build dataloaders, model, optimizer, trainer
-
-We keep the external behavior similar to src-ref but in a leaner codebase.
-"""
+"""Training setup: assemble distributed env, config, dataloaders, model, optimizer, and trainer."""
 
 from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -24,11 +15,12 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from src.configs.config import get_default_config
-from src.data.dataloader import MSGVIPDataset
-from src.models.importance_ranker import ImportanceRanker
-from src.training.loss import CombinedLoss
-from src.training.trainer import MemoryEfficientTrainer
+from src.config import get_default_config
+from src.data.splits import build_train_val_datasets
+from src.models.ranker import PersonRanker
+from src.engine.loss import CombinedLoss
+from src.engine.trainer import Trainer
+from src.utils.io import to_jsonable
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +41,9 @@ class TrainingRuntime:
 
         self.output_paths: Dict[str, Path] = {}
         self.config = None
-        self.trainer: Optional[MemoryEfficientTrainer] = None
+        self.trainer: Optional[Trainer] = None
 
-        self.logger = logging.getLogger("msg_vip_training")
+        self.logger = logging.getLogger("training")
 
     def run(self) -> int:
         try:
@@ -61,10 +53,8 @@ class TrainingRuntime:
             self._build_trainer()
 
             if getattr(self.args, "validate_only", False):
-                # one pass validate
                 self.trainer.current_epoch = 0
-                from src.training.loops import validate_epoch
-
+                from src.engine.loops import validate_epoch
                 validate_epoch(self.trainer)
                 return 0
 
@@ -75,11 +65,8 @@ class TrainingRuntime:
             return 1
 
     def _apply_performance_tuning(self) -> None:
-        assert self.config is not None
         if self.device.type != "cuda":
             return
-
-        # Engineering defaults: these are broadly beneficial for fixed-size training.
         torch.backends.cudnn.benchmark = True
         allow_tf32 = True
         if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
@@ -88,7 +75,6 @@ class TrainingRuntime:
             torch.backends.cudnn.allow_tf32 = allow_tf32
         if hasattr(torch, "set_float32_matmul_precision"):
             torch.set_float32_matmul_precision("high")
-
         self.logger.info(
             "Perf tuning: cudnn_benchmark=%s allow_tf32=%s",
             bool(torch.backends.cudnn.benchmark),
@@ -133,8 +119,7 @@ class TrainingRuntime:
         self.logger.propagate = False
         self.logger.setLevel(numeric_level)
 
-        # Avoid duplicated handlers if runtime is constructed multiple times (e.g. tests).
-        if getattr(self.logger, "_msgvip_configured", False):
+        if getattr(self.logger, "_logger_configured", False):
             return
 
         fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -154,13 +139,13 @@ class TrainingRuntime:
         rh.setFormatter(fmt)
         self.logger.addHandler(rh)
         root = logging.getLogger()
-        if not getattr(root, "_msgvip_root_configured", False):
+        if not getattr(root, "_root_logger_configured", False):
             root.setLevel(numeric_level)
             for h in self.logger.handlers:
                 root.addHandler(h)
-            setattr(root, "_msgvip_root_configured", True)
+            setattr(root, "_root_logger_configured", True)
 
-        setattr(self.logger, "_msgvip_configured", True)
+        setattr(self.logger, "_logger_configured", True)
 
         if self.is_main_process:
             meta = {
@@ -171,7 +156,7 @@ class TrainingRuntime:
             with (self.output_paths["records"] / "run_meta.json").open("w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
 
-        self.logger.info("MSG_VIP training runtime initialized")
+        self.logger.info("Training runtime initialized")
         self.logger.info("Device: %s", self.device)
         self.logger.info("Distributed: %s rank=%d/%d", self.is_distributed, self.rank, self.world_size)
         self.logger.info("Output directory: %s", self.output_paths["run_dir"])
@@ -179,7 +164,8 @@ class TrainingRuntime:
     def _load_and_override_config(self) -> None:
         config = get_default_config()
 
-        # CLI overrides
+        if getattr(self.args, "seed", None) is not None:
+            config.training.seed = int(self.args.seed)
         config.training.debug = bool(getattr(self.args, "debug", False))
         if config.training.debug:
             config.training.debug_output_dir = str(self.output_paths["records"] / "debug")
@@ -214,13 +200,15 @@ class TrainingRuntime:
                 raise ValueError(f"data_ratio must be in (0,1], got {ratio}")
             config.data.data_ratio = ratio
             config.data.max_samples = None
-            
+
         if getattr(self.args, "importance_weight", None) is not None:
             config.model.loss.importance_weight = float(self.args.importance_weight)
         if getattr(self.args, "preference_weight", None) is not None:
             config.model.loss.preference_weight = float(self.args.preference_weight)
         if bool(getattr(self.args, "no_gat", False)):
             config.model.gatv2.enabled = False
+        if bool(getattr(self.args, "no_spatial_edges", False)):
+            config.model.gatv2.use_spatial_edges = False
         if bool(getattr(self.args, "no_temporal_edges", False)):
             config.model.gatv2.use_temporal_edges = False
         if bool(getattr(self.args, "no_edge_features", False)):
@@ -246,9 +234,16 @@ class TrainingRuntime:
             config.model.relation.enabled = bool(int(self.args.relation_enabled))
         if getattr(self.args, "unfreeze_layers", None) is not None:
             config.model.features.dino.unfreeze_layers = int(self.args.unfreeze_layers)
-
         if getattr(self.args, "logit_temperature", None) is not None:
             config.model.scoring.temperature = float(self.args.logit_temperature)
+        if getattr(self.args, "backbone_lr_scale", None) is not None:
+            config.training.backbone_lr_scale = float(self.args.backbone_lr_scale)
+
+        # Global context (KCGC)
+        if bool(getattr(self.args, "no_global_context", False)):
+            config.model.global_context.enabled = False
+        if getattr(self.args, "global_num_keyframes", None) is not None:
+            config.model.global_context.num_keyframes = int(self.args.global_num_keyframes)
 
         config.training.distributed = self.is_distributed
         config.training.world_size = self.world_size
@@ -258,162 +253,22 @@ class TrainingRuntime:
 
         if self.is_main_process:
             with (self.output_paths["configs"] / "run_config.json").open("w", encoding="utf-8") as f:
-                json.dump(_to_jsonable(config), f, ensure_ascii=False, indent=2)
+                json.dump(to_jsonable(config), f, ensure_ascii=False, indent=2)
 
     def _build_trainer(self) -> None:
         assert self.config is not None
 
-        ratio = float(getattr(self.config.data, "data_ratio", 1.0) or 1.0)
-        data_root = Path(self.config.data.data_dir)
-
-        class _FileListDataset(MSGVIPDataset):
-            def __init__(self, file_list, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.file_list = [str(p) for p in file_list]
-
-        def _ratio_to_max_samples(split: str, *, required: bool = True) -> int | None:
-            split_dir = data_root / split
-            if not split_dir.exists():
-                if required:
-                    raise ValueError(f"Split directory not found: {split_dir}")
-                return None
-
-            if ratio >= 1.0:
-                return int(getattr(self.config.data, "max_samples", None)) if getattr(self.config.data, "max_samples", None) is not None else None
-
-            npz_files = list(split_dir.glob("*.npz"))
-            total = len(npz_files)
-            if total <= 0:
-                if required:
-                    raise ValueError(f"No NPZ files found in {split_dir}")
-                return None
-            keep = max(1, int(math.ceil(total * ratio)))
-            return keep
-
-        def _load_split_files(split: str, *, required: bool = True) -> list[Path]:
-            split_dir = data_root / split
-            if not split_dir.exists():
-                if required:
-                    raise ValueError(f"Split directory not found: {split_dir}")
-                return []
-
-            files = sorted(split_dir.glob("*.npz"))
-            if not files:
-                if required:
-                    raise ValueError(f"No NPZ files found in {split_dir}")
-                return []
-
-            max_keep = _ratio_to_max_samples(split, required=required)
-            return files[: int(max_keep)] if max_keep is not None else files
-
-        train_split_names = list(getattr(self.config.data, "train_splits", ["train", "test"]))
-        if not train_split_names:
-            raise ValueError("config.data.train_splits cannot be empty")
-        val_split_name = str(getattr(self.config.data, "val_split", "val"))
-
-        train_pool: list[Path] = []
-        split_counts: dict[str, int] = {}
-        for split_name in train_split_names:
-            files = _load_split_files(str(split_name), required=False)
-            if files:
-                train_pool.extend(files)
-                split_counts[str(split_name)] = len(files)
-            else:
-                split_counts[str(split_name)] = 0
-
-        train_pool = sorted(train_pool)
-        if not train_pool:
-            raise ValueError(
-                f"No NPZ files found for configured train_splits={train_split_names} under {data_root}"
-            )
-
-        missing_splits = [name for name, cnt in split_counts.items() if cnt == 0]
-        if missing_splits:
-            self.logger.warning(
-                "Some configured train_splits are empty/missing: %s",
-                ", ".join(missing_splits),
-            )
-        self.logger.info(
-            "Training splits=%s -> train_pool=%d (%s)",
-            train_split_names,
-            len(train_pool),
-            ", ".join(f"{k}:{v}" for k, v in split_counts.items()),
-        )
-
-        val_files = _load_split_files(val_split_name, required=True)
-
-        # 把旧 val 的多少比例换进 train，同时从 train 换出同样数量到 val
-        swap_splits = bool(getattr(self.args, "swap_splits", False))
-        swap_fraction = float(getattr(self.args, "swap_fraction", 0.5))
-
-        if not swap_splits or swap_fraction <= 0.0:
-            train_ds = _FileListDataset(train_pool, config=self.config, data_path=self.config.data.data_dir, split="train", max_samples=None)
-            val_ds = _FileListDataset(val_files, config=self.config, data_path=self.config.data.data_dir, split="val", max_samples=None)
-        else:
-            import numpy as np
-            from collections import defaultdict
-
-            def _bucket_key(npz_path: Path) -> tuple[str, int]:
-                d = np.load(npz_path, allow_pickle=True)
-                sc = d["scene_category"].item() if hasattr(d["scene_category"], "item") else str(d["scene_category"])
-                pm = d["person_mask"].astype(bool)
-                n_people = int(pm.any(axis=0).sum())
-                return (str(sc), n_people)
-
-            buckets: dict[tuple[str, int], list[Path]] = defaultdict(list)
-            for p in train_pool:
-                buckets[_bucket_key(p)].append(p)
-            for p in val_files:
-                buckets[_bucket_key(p)].append(p)
-
-            target_train = len(train_pool)
-            target_val = len(val_files)
-
-            old_train_set = set(train_pool)
-            old_val_set = set(val_files)
-
-            new_train: list[Path] = []
-            new_val: list[Path] = []
-
-            for key in sorted(buckets.keys()):
-                group = sorted(buckets[key])
-                g_train = [p for p in group if p in old_train_set]
-                g_val = [p for p in group if p in old_val_set]
-
-                k = int(round(len(g_val) * swap_fraction))
-                k = max(0, min(len(g_val), len(g_train), k))
-
-                new_train.extend(g_train[k:])
-                new_train.extend(g_val[:k])
-
-                new_val.extend(g_val[k:])
-                new_val.extend(g_train[:k])
-
-            def _pad_or_trim(primary: list[Path], secondary: list[Path], target: int) -> list[Path]:
-                if len(primary) >= target:
-                    return primary[:target]
-                need = target - len(primary)
-                return primary + secondary[:need]
-
-            new_train = _pad_or_trim(new_train, new_val, target_train)
-            new_val = _pad_or_trim(new_val, new_train, target_val)
-
-            train_ds = _FileListDataset(new_train, config=self.config, data_path=self.config.data.data_dir, split="train", max_samples=None)
-            val_ds = _FileListDataset(new_val, config=self.config, data_path=self.config.data.data_dir, split="val", max_samples=None)
-
-        self.logger.info(
-            "Dataset sizing: data_ratio=%.3f train=%d val=%d",
-            ratio,
-            len(train_ds),
-            len(val_ds),
+        train_ds, val_ds = build_train_val_datasets(
+            self.config,
+            swap_splits=bool(getattr(self.args, "swap_splits", False)),
+            swap_fraction=float(getattr(self.args, "swap_fraction", 0.5)),
         )
 
         train_sampler = DistributedSampler(train_ds, shuffle=True) if self.is_distributed else None
         val_sampler = DistributedSampler(val_ds, shuffle=False) if self.is_distributed else None
 
         num_workers = int(self.config.training.num_workers)
-        use_persistent_workers = num_workers > 0
-        prefetch_factor = 4
+        prefetch_factor = 2 if num_workers > 0 else None
 
         train_loader = DataLoader(
             train_ds,
@@ -422,8 +277,8 @@ class TrainingRuntime:
             sampler=train_sampler,
             num_workers=num_workers,
             pin_memory=bool(self.config.training.pin_memory),
-            persistent_workers=use_persistent_workers,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=prefetch_factor,
             drop_last=self.is_distributed,
         )
         val_loader = DataLoader(
@@ -433,53 +288,60 @@ class TrainingRuntime:
             sampler=val_sampler,
             num_workers=num_workers,
             pin_memory=bool(self.config.training.pin_memory),
-            persistent_workers=use_persistent_workers,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=prefetch_factor,
             drop_last=False,
         )
 
-        model = ImportanceRanker(self.config)
-        model = model.to(self.device)
+        model = PersonRanker(self.config).to(self.device)
 
-        # optimizer: only trainable params (CLIP frozen by default)
-        params = [p for p in model.parameters() if p.requires_grad]
-        opt = torch.optim.AdamW(
-            params,
-            lr=float(self.config.training.learning_rate),
+        # Differential learning rate: backbone vs. head
+        base_lr = float(self.config.training.learning_rate)
+        backbone_lr_scale = float(getattr(self.config.training, "backbone_lr_scale", 1.0))
+        backbone_lr = base_lr * backbone_lr_scale
+
+        backbone_params = []
+        head_params = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            (backbone_params if "vision.backbone" in name else head_params).append(p)
+
+        param_groups = []
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": backbone_lr})
+        if head_params:
+            param_groups.append({"params": head_params, "lr": base_lr})
+
+        if backbone_lr_scale != 1.0:
+            self.logger.info(
+                "Differential LR: backbone=%.2e (scale=%.2f) head=%.2e",
+                backbone_lr, backbone_lr_scale, base_lr,
+            )
+
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            lr=base_lr,
             weight_decay=float(self.config.training.weight_decay),
             betas=self.config.training.betas,
         )
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, int(self.config.training.num_epochs)),
+            eta_min=float(self.config.training.min_lr),
+        )
 
-        sched = CosineAnnealingLR(opt, T_max=max(1, int(self.config.training.num_epochs)), eta_min=float(self.config.training.min_lr))
-
-        loss_fn = CombinedLoss(config=self.config)
-
-        self.trainer = MemoryEfficientTrainer(
+        self.trainer = Trainer(
             config=self.config,
             model=model,
             train_dataloader=train_loader,
             val_dataloader=val_loader,
-            optimizer=opt,
-            scheduler=sched,
-            loss_function=loss_fn,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            loss_function=CombinedLoss(config=self.config),
             device=self.device,
             visualization_dir=str(self.output_paths["visualizations"]),
             checkpoint_dir=str(self.output_paths["checkpoints"]),
             records_dir=str(self.output_paths["records"]),
             predictions_dir=str(self.output_paths["predictions"]),
         )
-
-
-def _to_jsonable(obj: Any) -> Any:
-    if hasattr(obj, "__dict__") and not isinstance(obj, dict):
-        out = {}
-        for k, v in obj.__dict__.items():
-            out[k] = _to_jsonable(v)
-        return out
-    if isinstance(obj, dict):
-        return {k: _to_jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_to_jsonable(v) for v in obj]
-    if isinstance(obj, Path):
-        return str(obj)
-    return obj

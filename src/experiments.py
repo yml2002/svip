@@ -3,24 +3,24 @@
 
 Modes:
   all         — run ablation + seed + hyperparam in sequence
-  ablation    — ablation study (6 experiments)
+  ablation    — ablation study (7 experiments, each removes one design component)
   seed        — multi-seed stability (full model × 3 seeds)
   hyperparam  — hyperparameter sensitivity (6 params, 20 configs)
 
 Usage:
   # Run ALL experiments at once
-  python src/run_experiments.py all --batch_size 32 --num_epochs 15 --nproc_per_node 7
+  python src/experiments.py all --batch_size 32 --num_epochs 15 --nproc_per_node 7
 
   # Quick test with tiny data
-  python src/run_experiments.py all --batch_size 2 --num_epochs 1 --data_ratio 0.05 --num_workers 4
+  python src/experiments.py all --batch_size 2 --num_epochs 1 --data_ratio 0.05 --num_workers 4
 
   # Run specific mode
-  python src/run_experiments.py ablation --batch_size 32 --num_epochs 15
-  python src/run_experiments.py seed --experiments full --seeds 42,3407,2026
-  python src/run_experiments.py hyperparam --experiments lr_1e5,lr_5e5,lr_1e4
+  python src/experiments.py ablation --batch_size 32 --num_epochs 15
+  python src/experiments.py seed --experiments full --seeds 42,3407,2026
+  python src/experiments.py hyperparam --experiments lr_1e5,lr_5e5,lr_1e4
 
   # Multi-GPU
-  python src/run_experiments.py all --nproc_per_node 7 --batch_size 32 --num_epochs 15
+  python src/experiments.py all --nproc_per_node 7 --batch_size 32 --num_epochs 15
 """
 
 import argparse
@@ -35,20 +35,23 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 # ============================================================
-# Ablation: 6 experiments — each removes one design component
+# Ablation: 7 experiments — each removes one independent design decision
 # ============================================================
 ABLATION_CONFIGS = {
-    "full":         {},
-    "self_only":    {"--relation_enabled": "0"},
-    "rel_only":     {"--self_enabled": "0"},
-    "no_gat":       {"--no_gat": None},
-    "no_temporal":  {"--no_temporal_edges": None},
-    "no_edge_feat": {"--no_edge_features": None},
-    "no_geom":      {"--no_geom": None},
-    "gcn":          {"--graph_type": "gcn"},
+    "full":          {},                                    # Complete model
+    "no_relation":   {"--relation_enabled": "0"},          # Remove relation branch (self branch only)
+    "no_geom":       {"--no_geom": None},                  # Remove BBoxGeomEncoder
+    "no_gat":        {"--no_gat": None},                   # Replace GAT with MLP (no graph structure)
+    "no_spatial":    {"--no_spatial_edges": None},          # Remove spatial edges (GAT temporal-only)
+    "no_temporal":   {"--no_temporal_edges": None},        # Remove temporal edges (GAT spatial-only)
+    "gcn":           {"--graph_type": "gcn",               # GATv2→GCN (also disables edge features, GCN doesn't support them)
+                      "--no_edge_features": None},
+    "no_global_ctx": {"--no_global_context": None},        # Remove KCGC
 }
-ABLATION_ORDER = ["full", "self_only", "rel_only", "no_gat", "gcn", "no_temporal", "no_edge_feat", "no_geom"]
+ABLATION_ORDER = ["full", "no_temporal", "gcn", "no_global_ctx", "no_relation", "no_geom", "no_gat", "no_spatial"]
 
 # ============================================================
 # Multi-seed: full model × 3 seeds
@@ -84,6 +87,10 @@ HYPERPARAM_CONFIGS = {
     # DINOv2 unfreeze: {0(frozen), 1*(default)}
     "unfreeze_0":    {"--unfreeze_layers": "0"},
     "unfreeze_1":    {},
+    # KCGC keyframes: {4, 8*, 16}
+    "kf_4":          {"--global_num_keyframes": "4"},
+    "kf_8":          {},
+    "kf_16":         {"--global_num_keyframes": "16"},
 }
 HYPERPARAM_ORDER = [
     "gat_layers_1", "gat_layers_2", "gat_layers_3",
@@ -92,21 +99,39 @@ HYPERPARAM_ORDER = [
     "topk_2", "topk_4", "topk_all",
     "lr_1e5", "lr_2e5", "lr_5e5", "lr_1e4", "lr_2e4",
     "unfreeze_0", "unfreeze_1",
+    "kf_4", "kf_8", "kf_16",
 ]
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="CVPR Experiment Runner")
+    from src.config import get_default_config
+    cfg = get_default_config()
+    tr = cfg.training
+
+    p = argparse.ArgumentParser(
+        description="CVPR Experiment Runner",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     p.add_argument("mode", choices=["all", "ablation", "seed", "hyperparam"])
-    p.add_argument("--batch_size", "-b", type=int, default=32)
-    p.add_argument("--accumulation_steps", type=int, default=1)
-    p.add_argument("--num_epochs", "-e", type=int, default=15)
-    p.add_argument("--learning_rate", "-l", type=float, default=5e-5)
-    p.add_argument("--data_ratio", type=float, default=1.0)
-    p.add_argument("--num_workers", "-w", type=int, default=8)
-    p.add_argument("--roi_chunk", type=int, default=512)
-    p.add_argument("--early_stop", type=int, default=3)
-    p.add_argument("--seed", type=int, default=2026)
+    # Defaults come from config.py — no duplicate hardcoding here.
+    p.add_argument("--batch_size", "-b", type=int, default=None,
+                   help=f"per-GPU batch size (config default: {tr.batch_size})")
+    p.add_argument("--accumulation_steps", type=int, default=None,
+                   help=f"gradient accumulation steps (config default: {tr.accumulation_steps})")
+    p.add_argument("--num_epochs", "-e", type=int, default=None,
+                   help=f"training epochs (config default: {tr.num_epochs})")
+    p.add_argument("--learning_rate", "-l", type=float, default=None,
+                   help=f"learning rate (config default: {tr.learning_rate})")
+    p.add_argument("--data_ratio", type=float, default=None,
+                   help="fraction of data to use, (0,1] (config default: 1.0)")
+    p.add_argument("--num_workers", "-w", type=int, default=None,
+                   help=f"DataLoader workers (config default: {tr.num_workers})")
+    p.add_argument("--roi_chunk", type=int, default=None,
+                   help=f"ROI crop chunk size (config default: {tr.roi_chunk})")
+    p.add_argument("--early_stop", type=int, default=None,
+                   help=f"early-stop patience epochs (config default: {tr.early_stop})")
+    p.add_argument("--seed", type=int, default=None,
+                   help=f"Random seed (config default: {tr.seed})")
     p.add_argument("--seeds", type=str, default=None,
                    help="Comma-separated seeds for seed mode")
     p.add_argument("--nproc_per_node", type=int, default=1)
@@ -121,19 +146,25 @@ _next_port = 29500
 
 def build_command(args, extra_flags: dict, output_dir: str, seed: int) -> list[str]:
     global _next_port
-    train_args = [
-        "src/train.py",
-        "--batch_size", str(args.batch_size),
-        "--accumulation_steps", str(args.accumulation_steps),
-        "--num_epochs", str(args.num_epochs),
-        "--learning_rate", str(args.learning_rate),
-        "--data_ratio", str(args.data_ratio),
-        "--num_workers", str(args.num_workers),
-        "--roi_chunk", str(args.roi_chunk),
-        "--early_stop", str(args.early_stop),
-        "--seed", str(seed),
-        "--output_dir", output_dir,
-    ]
+    from src.config import get_default_config as _cfg
+    effective_seed = seed if seed is not None else _cfg().training.seed
+    train_args = ["src/train.py", "--seed", str(effective_seed), "--output_dir", output_dir]
+
+    # Only forward flags that were explicitly set; omitted ones use config.py defaults.
+    optional = {
+        "--batch_size":        args.batch_size,
+        "--accumulation_steps": args.accumulation_steps,
+        "--num_epochs":        args.num_epochs,
+        "--learning_rate":     args.learning_rate,
+        "--data_ratio":        args.data_ratio,
+        "--num_workers":       args.num_workers,
+        "--roi_chunk":         args.roi_chunk,
+        "--early_stop":        args.early_stop,
+    }
+    for flag, value in optional.items():
+        if value is not None:
+            train_args += [flag, str(value)]
+
     for flag, value in extra_flags.items():
         train_args.append(flag)
         if value is not None:
@@ -178,35 +209,73 @@ def run_one(args, name: str, flags: dict, out_dir: Path, seed: int) -> dict:
     print(f"  Config: {flags_str}  seed={seed}")
 
     t0 = time.time()
+    proc = None
+
     try:
-        with open(out_dir / "stdout.log", "w") as fo, open(out_dir / "stderr.log", "w") as fe:
-            # start_new_session=True puts child in its own process group
-            # so we can kill the entire group (torchrun + all workers)
-            proc = subprocess.Popen(cmd, stdout=fo, stderr=fe, start_new_session=True)
-            proc.wait()
+        with open(out_dir / "stdout.log", "w") as fo, \
+             open(out_dir / "stderr.log", "w") as fe:
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=fo,
+                stderr=fe,
+                start_new_session=True,
+            )
+
+            # non-blocking wait
+            while proc.poll() is None:
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    continue
+
     except KeyboardInterrupt:
-        # Kill entire process group (torchrun + worker processes)
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.wait()
-        print(f"\n  Interrupted, all child processes killed.")
-        return {"status": "INTERRUPTED", "time_seconds": time.time() - t0}
+        print("\n🛑 KeyboardInterrupt received, killing all child processes...")
+
+        if proc is not None:
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        # 保险：杀 torchrun
+        subprocess.run(
+            ["pkill", "-f", "torchrun"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        print("✅ All processes killed")
+        return {
+            "status": "INTERRUPTED",
+            "time_seconds": time.time() - t0
+        }
+
     dt = time.time() - t0
 
     if proc.returncode != 0:
         err = (out_dir / "stderr.log").read_text().strip().split("\n")
         print(f"  FAILED ({dt:.0f}s)")
-        for l in err[-3:]: print(f"    {l}")
+        for l in err[-3:]:
+            print(f"    {l}")
         return {"status": "FAILED", "time_seconds": dt}
 
     rd = find_run_subdir(out_dir)
     m = extract_best(rd) if rd else {}
-    print(f"  OK ({dt:.0f}s) ep={m.get('best_epoch',0)} "
-          f"r@1={m.get('best_rank1',0):.2f}% r@2={m.get('best_rank2',0):.2f}% r@3={m.get('best_rank3',0):.2f}%")
+    print(
+        f"  OK ({dt:.0f}s) ep={m.get('best_epoch',0)} "
+        f"r@1={m.get('best_rank1',0):.2f}% "
+        f"r@2={m.get('best_rank2',0):.2f}% "
+        f"r@3={m.get('best_rank3',0):.2f}%"
+    )
     return {"status": "OK", "time_seconds": dt, **m}
-
 
 def print_table(results: dict, order: list, ref_key: str = "full"):
     ref_r1 = results.get(ref_key, {}).get("best_rank1", 0)
@@ -362,11 +431,23 @@ def do_hyperparam(args, root: Path):
 # ============================================================
 def main():
     args = parse_args()
+
+    from src.config import get_default_config
+    _cfg = get_default_config().training
+    # Resolve seed once so all sub-functions see a concrete int
+    if args.seed is None:
+        args.seed = _cfg.seed
+    # Effective values: CLI arg if set, otherwise config.py default
+    eff_bs     = args.batch_size        or _cfg.batch_size
+    eff_accum  = args.accumulation_steps or _cfg.accumulation_steps
+    eff_epochs = args.num_epochs        or _cfg.num_epochs
+    eff_lr     = args.learning_rate     or _cfg.learning_rate
+    eff_ratio  = args.data_ratio        or 1.0
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     root = Path(args.output_base) / f"experiments_{timestamp}"
     root.mkdir(parents=True, exist_ok=True)
 
-    # Save meta
     meta = {"mode": args.mode, "timestamp": timestamp,
             "args": {k: v for k, v in vars(args).items() if v is not None}}
     with open(root / "meta.json", "w") as f:
@@ -375,8 +456,8 @@ def main():
     gpu_str = f"{args.nproc_per_node} GPUs" if args.nproc_per_node > 1 else "1 GPU"
     print(f"{'='*60}")
     print(f"CVPR Experiments — mode={args.mode} — {gpu_str}")
-    print(f"bs={args.batch_size} accum={args.accumulation_steps} epochs={args.num_epochs} "
-          f"lr={args.learning_rate} data_ratio={args.data_ratio}")
+    print(f"bs={eff_bs} accum={eff_accum} epochs={eff_epochs} "
+          f"lr={eff_lr} data_ratio={eff_ratio}")
     print(f"Output: {root}")
     print(f"{'='*60}")
 

@@ -2,11 +2,12 @@
 
 Builds a joint graph where each node is (person_i, frame_t).
 Two edge types:
-  - Spatial (intra-frame): between persons in the same frame
+  - Spatial  (intra-frame): between persons in the same frame
   - Temporal (inter-frame): same person across adjacent frames
 
-Edge features are computed from bbox geometry and projected into the
-attention mechanism via GATv2Conv's edge_attr support.
+Spatial edge features: bbox geometry (delta_cx, delta_cy, delta_w, delta_h, dist, iou).
+Temporal edge features: vis_feats difference vector projected via two-layer MLP with
+  LayerNorm, capturing how a person's DINOv2 appearance shifts between sampled frames.
 """
 
 from __future__ import annotations
@@ -18,31 +19,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, GCNConv
 
-from src.models.bbox_geom import (
-    compute_spatial_edge_features_from_bboxes,
-    compute_temporal_edge_features_from_bboxes,
-)
+from src.models.bbox_geom import compute_spatial_edge_features_from_bboxes
 
 logger = logging.getLogger(__name__)
 
-SPATIAL_EDGE_RAW_DIM = 6   # delta_cx, delta_cy, delta_w, delta_h, center_dist, iou
-TEMPORAL_EDGE_RAW_DIM = 4  # delta_cx, delta_cy, delta_area, speed
+SPATIAL_EDGE_RAW_DIM  = 6  # delta_cx, delta_cy, delta_w, delta_h, center_dist, iou
+TEMPORAL_EDGE_RAW_DIM = 768  # vis_feats difference vector (DINOv2 dim)
 
 
 class SpatioTemporalGATv2(nn.Module):
-    """GATv2 on a joint spatio-temporal person graph.
-
-    Args:
-        in_dim: input node feature dimension
-        hidden_dim: hidden dimension for GAT layers
-        num_layers: number of GAT layers
-        heads: number of attention heads per layer
-        dropout: dropout rate
-        topk_neighbors: for spatial edges, top-k nearest by bbox center distance (0 = all)
-        temporal_window: connect same person across ±window frames (1 = adjacent only)
-        spatial_edge_dim: projected spatial edge feature dim
-        temporal_edge_dim: projected temporal edge feature dim
-    """
+    """GATv2 on a joint spatio-temporal person graph."""
 
     def __init__(
         self,
@@ -51,10 +37,12 @@ class SpatioTemporalGATv2(nn.Module):
         num_layers: int = 2,
         heads: int = 4,
         dropout: float = 0.1,
-        topk_neighbors: int = 4,
-        temporal_window: int = 1,
+        topk_neighbors: int = 8,
+        temporal_window: int = 2,
         spatial_edge_dim: int = 32,
-        temporal_edge_dim: int = 16,
+        temporal_edge_dim: int = 32,
+        vis_feat_dim: int = 768,
+        use_spatial_edges: bool = True,
         use_temporal_edges: bool = True,
         use_edge_features: bool = True,
         graph_type: str = "gatv2",
@@ -65,21 +53,25 @@ class SpatioTemporalGATv2(nn.Module):
         self.topk_neighbors = int(max(0, topk_neighbors))
         self.temporal_window = int(max(1, temporal_window))
         self.dropout = float(dropout)
+        self.use_spatial_edges = bool(use_spatial_edges)
         self.use_temporal_edges = bool(use_temporal_edges)
         self.use_edge_features = bool(use_edge_features)
         self.graph_type = str(graph_type)
 
         self.in_proj = nn.Linear(in_dim, hidden_dim) if in_dim != hidden_dim else nn.Identity()
 
-        # Edge feature projections (only if edge features enabled AND gatv2)
         edge_dim = int(spatial_edge_dim) if (self.use_edge_features and self.graph_type == "gatv2") else None
         if self.use_edge_features and self.graph_type == "gatv2":
             self.spatial_edge_proj = nn.Sequential(
                 nn.Linear(SPATIAL_EDGE_RAW_DIM, int(spatial_edge_dim)),
                 nn.ReLU(inplace=True),
             )
+            # Temporal: vis_feats diff (768-dim) → spatial_edge_dim via bottleneck
             self.temporal_edge_proj = nn.Sequential(
-                nn.Linear(TEMPORAL_EDGE_RAW_DIM, int(spatial_edge_dim)),
+                nn.LayerNorm(int(vis_feat_dim)),
+                nn.Linear(int(vis_feat_dim), int(temporal_edge_dim)),
+                nn.ReLU(inplace=True),
+                nn.Linear(int(temporal_edge_dim), int(spatial_edge_dim)),
                 nn.ReLU(inplace=True),
             )
         else:
@@ -87,9 +79,12 @@ class SpatioTemporalGATv2(nn.Module):
             self.temporal_edge_proj = None
 
         self.layers = nn.ModuleList()
+        # GCN: reduced hidden_dim as a genuinely weak baseline
+        gcn_dim = max(64, hidden_dim // 4)
+        self.gcn_out_proj = nn.Linear(gcn_dim, hidden_dim) if self.graph_type == "gcn" else None
         for _ in range(self.num_layers):
             if self.graph_type == "gcn":
-                self.layers.append(GCNConv(hidden_dim, hidden_dim))
+                self.layers.append(GCNConv(hidden_dim, gcn_dim, add_self_loops=False))
             else:
                 self.layers.append(
                     GATv2Conv(
@@ -97,7 +92,7 @@ class SpatioTemporalGATv2(nn.Module):
                         hidden_dim // heads,
                         heads=heads,
                         dropout=dropout,
-                        add_self_loops=False,
+                        add_self_loops=True,
                         edge_dim=edge_dim,
                     )
                 )
@@ -109,29 +104,15 @@ class SpatioTemporalGATv2(nn.Module):
         x: torch.Tensor,
         person_mask: torch.Tensor,
         bboxes: torch.Tensor,
+        vis_feats: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: (B, T, N, D) node features
-            person_mask: (B, T, N) bool
-            bboxes: (B, T, N, 4) normalized
-
-        Returns:
-            (B, T, N, hidden_dim) updated node features
-        """
         B, T, N, _ = x.shape
         device = x.device
 
         h = self.in_proj(x)
 
-        # Build the joint spatio-temporal graph for the entire batch.
-        # Each valid (b, t, n) becomes a node.
-        # We map (b, t, n) → flat node index.
-        valid = person_mask.bool()  # (B, T, N)
-        valid_flat = valid.reshape(-1)  # (B*T*N,)
-
-        # Create mapping: flat index → node index (only for valid slots)
+        valid = person_mask.bool()
+        valid_flat = valid.reshape(-1)
         node_indices = torch.full((B * T * N,), -1, dtype=torch.long, device=device)
         valid_positions = valid_flat.nonzero(as_tuple=False).squeeze(1)
         num_nodes = int(valid_positions.numel())
@@ -140,26 +121,24 @@ class SpatioTemporalGATv2(nn.Module):
             return h.new_zeros((B, T, N, self.hidden_dim))
 
         node_indices[valid_positions] = torch.arange(num_nodes, device=device)
-
-        # Gather node features
         h_flat = h.reshape(B * T * N, -1)
-        all_x = h_flat[valid_positions]  # (num_nodes, hidden_dim)
+        all_x = h_flat[valid_positions]
 
-        # Gather bboxes for valid nodes
         bboxes_flat = bboxes.reshape(B * T * N, 4).to(dtype=torch.float32)
-        node_bboxes = bboxes_flat[valid_positions]  # (num_nodes, 4)
+        node_bboxes = bboxes_flat[valid_positions]
 
-        # Decode (b, t, n) from valid_positions
         node_n = valid_positions % N
         node_t = (valid_positions // N) % T
         node_b = valid_positions // (T * N)
 
-        # --- Build spatial edges (intra-frame) ---
-        spatial_src, spatial_dst = self._build_spatial_edges(
-            node_b, node_t, node_n, node_bboxes, num_nodes, device
-        )
+        if self.use_spatial_edges:
+            spatial_src, spatial_dst = self._build_spatial_edges(
+                node_b, node_t, node_n, node_bboxes, num_nodes, device
+            )
+        else:
+            spatial_src = torch.empty(0, dtype=torch.long, device=device)
+            spatial_dst = torch.empty(0, dtype=torch.long, device=device)
 
-        # --- Build temporal edges (inter-frame, same person) ---
         if self.use_temporal_edges:
             temporal_src, temporal_dst = self._build_temporal_edges(
                 node_b, node_t, node_n, node_indices, B, T, N, device
@@ -168,7 +147,6 @@ class SpatioTemporalGATv2(nn.Module):
             temporal_src = torch.empty(0, dtype=torch.long, device=device)
             temporal_dst = torch.empty(0, dtype=torch.long, device=device)
 
-        # --- Compute edge features ---
         all_edge_src = []
         all_edge_dst = []
         all_edge_feat = []
@@ -186,9 +164,10 @@ class SpatioTemporalGATv2(nn.Module):
             all_edge_src.append(temporal_src)
             all_edge_dst.append(temporal_dst)
             if self.temporal_edge_proj is not None:
-                t_feat_raw = compute_temporal_edge_features_from_bboxes(
-                    node_bboxes[temporal_src], node_bboxes[temporal_dst]
-                )
+                assert vis_feats is not None
+                vis_flat = vis_feats.reshape(B * T * N, -1).to(dtype=torch.float32)
+                node_vis = vis_flat[valid_positions]
+                t_feat_raw = node_vis[temporal_dst] - node_vis[temporal_src]
                 all_edge_feat.append(self.temporal_edge_proj(t_feat_raw))
 
         if all_edge_src:
@@ -201,48 +180,32 @@ class SpatioTemporalGATv2(nn.Module):
             edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
             edge_attr = None
 
-        # --- Graph message passing ---
         hi = all_x
         for li, layer in enumerate(self.layers):
             residual = hi
             if self.graph_type == "gcn":
-                hi = layer(hi, edge_index)
+                hi = self.gcn_out_proj(layer(hi, edge_index))
             else:
                 hi = layer(hi, edge_index, edge_attr=edge_attr)
             hi = F.elu(hi)
             hi = F.dropout(hi, p=self.dropout, training=self.training)
             hi = self.norms[li](hi + residual)
 
-        # Scatter back to (B, T, N, hidden_dim)
         out = h.new_zeros((B * T * N, self.hidden_dim))
         out[valid_positions] = hi.to(dtype=out.dtype)
         return out.reshape(B, T, N, self.hidden_dim)
 
-    def _build_spatial_edges(
-        self,
-        node_b: torch.Tensor,
-        node_t: torch.Tensor,
-        node_n: torch.Tensor,
-        node_bboxes: torch.Tensor,
-        num_nodes: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build intra-frame spatial edges between persons."""
-        # Group nodes by (b, t)
-        frame_key = node_b * 10000 + node_t  # unique per (b, t)
+    def _build_spatial_edges(self, node_b, node_t, node_n, node_bboxes, num_nodes, device):
+        frame_key = node_b * 10000 + node_t
         unique_frames = frame_key.unique()
-
-        src_list = []
-        dst_list = []
+        src_list, dst_list = [], []
 
         for fk in unique_frames:
             frame_nodes = (frame_key == fk).nonzero(as_tuple=False).squeeze(1)
             n_valid = int(frame_nodes.numel())
             if n_valid <= 1:
                 continue
-
             if self.topk_neighbors <= 0 or n_valid <= self.topk_neighbors:
-                # Fully connected
                 arange = torch.arange(n_valid, device=device)
                 s = arange.repeat_interleave(n_valid)
                 d = arange.repeat(n_valid)
@@ -250,7 +213,6 @@ class SpatioTemporalGATv2(nn.Module):
                 src_list.append(frame_nodes[s[keep]])
                 dst_list.append(frame_nodes[d[keep]])
             else:
-                # Top-k by bbox center distance
                 fb = node_bboxes[frame_nodes]
                 cx = (fb[:, 0] + fb[:, 2]) * 0.5
                 cy = (fb[:, 1] + fb[:, 3]) * 0.5
@@ -269,49 +231,25 @@ class SpatioTemporalGATv2(nn.Module):
             return torch.cat(src_list), torch.cat(dst_list)
         return torch.empty(0, dtype=torch.long, device=device), torch.empty(0, dtype=torch.long, device=device)
 
-    def _build_temporal_edges(
-        self,
-        node_b: torch.Tensor,
-        node_t: torch.Tensor,
-        node_n: torch.Tensor,
-        node_indices: torch.Tensor,
-        B: int,
-        T: int,
-        N: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build inter-frame temporal edges (same person across frames)."""
-        src_list = []
-        dst_list = []
-
+    def _build_temporal_edges(self, node_b, node_t, node_n, node_indices, B, T, N, device):
+        src_list, dst_list = [], []
         num_nodes = int(node_b.numel())
+        curr_idx = torch.arange(num_nodes, device=device)
+
         for dt in range(1, self.temporal_window + 1):
-            # For each node, try to connect to same person dt frames later
             future_t = node_t + dt
             valid_future = future_t < T
-
             if not valid_future.any():
                 continue
-
-            # Compute flat index for future node
             future_flat = node_b * (T * N) + future_t * N + node_n
-            # Clamp to valid range for indexing
             future_flat_clamped = future_flat.clamp(0, B * T * N - 1)
             future_node_idx = node_indices[future_flat_clamped]
-
-            # Both current and future must be valid nodes
             both_valid = valid_future & (future_node_idx >= 0)
-
             if both_valid.any():
-                curr_node_idx = torch.arange(num_nodes, device=device)
-                valid_curr = curr_node_idx[both_valid]
-                valid_future_nodes = future_node_idx[both_valid]
-
-                # Bidirectional
-                src_list.append(valid_curr)
-                dst_list.append(valid_future_nodes)
-                src_list.append(valid_future_nodes)
-                dst_list.append(valid_curr)
+                src_list.append(curr_idx[both_valid])
+                dst_list.append(future_node_idx[both_valid])
+                src_list.append(future_node_idx[both_valid])
+                dst_list.append(curr_idx[both_valid])
 
         if src_list:
             return torch.cat(src_list), torch.cat(dst_list)

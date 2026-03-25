@@ -1,7 +1,4 @@
-"""Training-time visualization (loss/acc/rank curves).
-
-Kept close to src-ref behavior: produces pngs under output_paths['visualizations'].
-"""
+"""Training curve plots: loss, accuracy, and rank@k vs. epoch (saved as PNG)."""
 
 from __future__ import annotations
 

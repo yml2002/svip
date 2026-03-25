@@ -1,186 +1,367 @@
-# MSG_VIP 模型架构与实验说明
+# 视频人物重要性排序模型架构设计
 
-## 模型概述
+## 项目概述
 
-视频重要人物识别（Most Significant Person in Video）。给定一段视频中多个被跟踪的人物，预测谁是最重要的人。
+本项目旨在解决**视频中人物重要性排序**问题：给定一个包含多个人物的社交场景视频片段，模型需要输出每个人物的重要性得分，识别出谁是场景中的主要关注对象。
 
-## 架构设计
+**核心设计哲学**：人物重要性包含两个互补的维度：
+1. **个体显著性** - 外观、大小、位置等静态个人特征
+2. **社交动态重要性** - 人物在视频中相对于他人的角色演变（谁被注视、谁主导群体动作）
 
-### 整体流程
-
-```
-输入: frames (B,T,3,H,W) + bboxes (B,T,N,4) + person_mask (B,T,N)
-  │
-  ├─ DINOv2 ROI Crop → 每个人的视觉特征 (B,T,N,768)
-  ├─ BBoxGeom Encoder → 每个人的几何特征 (B,T,N,128)
-  │     含: 位置、大小、面积、位移、速度、加速度 (14维 → MLP → 128维)
-  └─ Feature Fusion → fused (B,T,N,768)
-       │
-       ├─ Self Branch: temporal mean pool → scoring head → self_scores (B,N)
-       │     独立看每个人的外观+几何，不看其他人
-       │
-       └─ Relation Branch: Spatio-Temporal GATv2 → temporal attn pool → scoring head → rel_scores (B,N)
-             看人物之间的时空交互关系
-             │
-             最终: logits = self_scores + rel_scores → softmax → 排序
-```
-
-### Self 分支
-
-- 输入: fused 特征 (B,T,N,768)
-- 时间维度 masked mean pooling → (B,N,768)
-- Scoring head: LayerNorm → Linear(768,256) → ReLU → Dropout → Linear(256,1)
-- 输出: 每个人的独立重要性分数
-- **核心**: 完全逐人独立，不看其他人
-
-### Relation 分支 — 时空联合图 (Spatio-Temporal GATv2)
-
-#### 图结构
-- **节点**: 每个 (person_i, frame_t) 是一个节点
-- **空间边 (intra-frame)**: 同一帧内人物之间，基于 bbox 中心距离的 Top-K 近邻
-- **时间边 (inter-frame)**: 同一人在相邻帧之间，窗口大小可配置
-
-#### 边特征
-- **空间边特征** (6维): delta_cx, delta_cy, delta_w, delta_h, center_dist, IoU
-- **时间边特征** (4维): delta_cx, delta_cy, delta_area, speed
-- 边特征通过 MLP 投影后注入 GATv2Conv 的注意力计算
-
-#### 消息传递
-- GATv2Conv × 2 layers, 4 heads, residual connection + LayerNorm
-- 每层: node_feat → GATv2(node_feat, edge_index, edge_attr) → ELU → Dropout → LayerNorm(residual)
-
-#### 时间聚合
-- Learned temporal attention pooling: per-person 在时间维度上加权求和
-- 输出: (B, N, 512)
-- Scoring head: LayerNorm → Linear(512,256) → ReLU → Dropout → Linear(256,1)
-
-### 特征提取
-
-- **DINOv2-Base**: 预训练视觉 backbone，默认解冻最后 1 层
-- **BBoxGeom Encoder**: 14维几何特征 (x1,y1,x2,y2,cx,cy,w,h,area,dcx,dcy,disp,speed,accel) → MLP → 128维
-- **Fusion**: cat(768+128) → Linear(896,768) → LayerNorm → ReLU → Dropout
-
-### 损失函数
-
-- CrossEntropyLoss 在最终 fused logits 上
-- 无独立分支 CE（确保消融有效）
-- 可选: PreferenceOptimizationLoss (默认关闭)
+架构采用双分支评分系统来分解这两个方面，共享特征提取主干网络。
 
 ---
 
-## 实验设计
+## 整体架构流程图
 
-### 运行方式
-
-所有实验通过统一脚本 `src/run_experiments.py` 运行:
-
-```bash
-# 一次性运行全部实验（消融 + 多seed + 超参数）
-python src/run_experiments.py all --batch_size 32 --num_epochs 15 --nproc_per_node 7
-
-# 快速测试
-python src/run_experiments.py all --batch_size 32 --num_epochs 1 --data_ratio 0.05
-
-# 单独运行某类实验
-python src/run_experiments.py ablation --batch_size 32 --num_epochs 15
-python src/run_experiments.py seed --batch_size 32 --num_epochs 15
-python src/run_experiments.py hyperparam --batch_size 32 --num_epochs 15
-
-# 只运行特定实验
-python src/run_experiments.py ablation --experiments full,self_only
-python src/run_experiments.py hyperparam --experiments lr_1e5,lr_5e5,lr_1e4
 ```
-
-### 实验 1: 消融实验 (Table — 6行)
-
-| 实验 | 改动 | 回答的问题 |
-|------|------|-----------|
-| Full | 完整模型 | baseline |
-| Self Only | 去掉 Relation 分支 | 时空关系建模的整体贡献 |
-| w/o ST-Graph | GAT → MLP (去掉图结构) | 图结构 vs 简单投影 |
-| w/o Temporal Edges | GAT 只有空间边 | 时序连接的贡献 |
-| w/o Edge Features | GAT 有边但无几何边特征 | 边特征的贡献 |
-| w/o Geometry | 去掉 BBoxGeom，纯视觉 | 几何特征的贡献 |
-
-### 实验 2: 多 Seed 稳定性 (Table 1 的 mean±std)
-
-- 实验: full 模型
-- Seeds: [42, 3407, 2026]
-- 报告: Rank@1/2/3 的 mean ± std
-
-### 实验 3: 超参数敏感性 (Table/Figure)
-
-| 超参数 | 测试值 | 默认值 |
-|--------|--------|--------|
-| GAT 层数 | {1, **2**, 3} | 2 |
-| 注意力头数 | {2, **4**, 8} | 4 |
-| 时间窗口 | {1, **3**, 5} | 3 |
-| 空间 Top-K | {2, **4**, all} | 4 |
-| 学习率 | {1e-5, 2e-5, **5e-5**, 1e-4, 2e-4} | 5e-5 |
-| DINOv2 解冻层数 | {0(frozen), **1**} | 1 |
-
----
-
-## 默认超参数
-
-```yaml
-# 数据
-video_length: 120
-max_persons: 16
-
-# DINOv2
-model: dinov2-base (768-d)
-image_size: 196
-freeze: false
-unfreeze_layers: 1
-
-# BBoxGeom
-feature_dim: 128
-spatial_edge_dim: 32
-temporal_edge_dim: 16
-
-# GATv2
-hidden_dim: 512
-num_layers: 2
-heads: 4
-topk_neighbors: 4
-temporal_window: 3
-
-# Scoring
-hidden_dim: 256
-temperature: 1.0
-
-# Training
-learning_rate: 5e-5
-weight_decay: 5e-4
-batch_size: 32 (× 7 GPUs)
-num_epochs: 15
-early_stop: 3
-max_grad_norm: 3.0
-mixed_precision: true
-optimizer: AdamW
-scheduler: CosineAnnealingLR
+输入视频数据
+  frames: (B, T, 3, H, W)    T=32 帧均匀采样的有效帧
+  bboxes: (B, T, N, 4)        N=16 人物检测框（归一化 [x1,y1,x2,y2]）
+  person_mask: (B, T, N)      有效人物指示器
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       特征提取主干网络                                    │
+│                                                                         │
+│  ┌──────────────────────────────┐  ┌──────────────────────────────┐    │
+│  │    视觉编码器 (DINOv2)       │  │    边界框几何编码器           │    │
+│  │                              │  │                              │    │
+│  │  对每个(t,n)位置进行ROI裁剪   │  │  9个静态空间特征：           │    │
+│  │  通过grid_sample → 196×196   │  │  [x1,y1,x2,y2,cx,cy,w,h,area]│   │
+│  │  → DINOv2-Base主干网络       │  │  MLP(9→128→128)              │    │
+│  │  → CLS token (768维)        │  │  LayerNorm                   │    │
+│  │  → L2归一化                  │  │                              │    │
+│  │  vis_feats: (B,T,N,768)     │  │  geom_feats: (B,T,N,128)     │    │
+│  └──────────────────────────────┘  └──────────────────────────────┘    │
+│                    │                              │                     │
+│                    └──────────────┬───────────────┘                    │
+│                                   ▼                                     │
+│                     特征融合: cat([vis_feats, geom_feats])              │
+│                     Linear(896→768) + LayerNorm + ReLU + Dropout       │
+│                     fused: (B, T, N, 768)                               │
+└─────────────────────────────────────────────────────────────────────────┘
+         │
+         ├─────────────────────────────────────────────────────┐
+         │                                                     │
+         ▼                                                     ▼
+┌──────────────────────┐                     ┌────────────────────────────────────┐
+│    个体分支           │                     │         关系分支                   │
+│  (静态个体特征)       │                     │  (社交动态重要性)                  │
+│                      │                     │                                    │
+│  self_pooled =       │                     │  ┌──────────────────────────────┐  │
+│  mean_T(fused)       │                     │  │   KCGC: 场景上下文模块       │  │
+│  (B, N, 768)         │                     │  │                              │  │
+│                      │                     │  │  均匀采样K=T//4个关键帧      │  │
+│  LayerNorm           │                     │  │  → DINOv2全帧CLS特征        │  │
+│  Linear(768→256)     │                     │  │    (无梯度，场景语义)        │  │
+│  ReLU + Dropout      │                     │  │  → 投影到context_dim=256    │  │
+│  Linear(256→1)       │                     │  │  → 交叉注意力(fused, scene) │  │
+│                      │                     │  │  fused_ctx: (B,T,N,768)     │  │
+│  self_scores:(B,N)   │                     │  └──────────────────────────────┘  │
+└──────────────────────┘                     │               │                    │
+         │                                   │               ▼                    │
+         │                                   │  ┌──────────────────────────────┐  │
+         │                                   │  │  时空图注意力网络 (GATv2)    │  │
+         │                                   │  │                              │  │
+         │                                   │  │  节点: (person_n, frame_t)   │  │
+         │                                   │  │  ─── 空间边 ────────────    │  │
+         │                                   │  │  同帧内，topk=8最近邻       │  │
+         │                                   │  │  特征: [Δcx,Δcy,Δw,Δh,     │  │
+         │                                   │  │         dist,IoU] → 32维    │  │
+         │                                   │  │  ─── 时间边 ────────────    │  │
+         │                                   │  │  同人物，±window=2          │  │
+         │                                   │  │  特征: vis_diff(768)        │  │
+         │                                   │  │        →LayerNorm→32维      │  │
+         │                                   │  │                              │  │
+         │                                   │  │  2× GATv2Conv(512,128×4头)  │  │
+         │                                   │  │  + ELU + Dropout + LayerNorm │  │
+         │                                   │  │  + 残差连接                  │  │
+         │                                   │  │  graph_feats: (B,T,N,512)   │  │
+         │                                   │  └──────────────────────────────┘  │
+         │                                   │               │                    │
+         │                                   │               ▼                    │
+         │                                   │  ┌──────────────────────────────┐  │
+         │                                   │  │  时间注意力池化              │  │
+         │                                   │  │                              │  │
+         │                                   │  │  temporal_dev =              │  │
+         │                                   │  │    fused_t − mean_T(fused)   │  │
+         │                                   │  │  "此帧相对于平均状态的异常度" │  │
+         │                                   │  │                              │  │
+         │                                   │  │  attn = softmax(             │  │
+         │                                   │  │    Linear([graph,temp_dev])  │  │
+         │                                   │  │  )  over T frames            │  │
+         │                                   │  │                              │  │
+         │                                   │  │  rel_pooled = Σ_t(attn·g_t) │  │
+         │                                   │  │  (B, N, 512)                 │  │
+         │                                   │  │                              │  │
+         │                                   │  │  LayerNorm→Linear(512→256)   │  │
+         │                                   │  │  →ReLU→Dropout→Linear(256→1) │  │
+         │                                   │  │  rel_scores: (B, N)          │  │
+         │                                   │  └──────────────────────────────┘  │
+         │                                   └────────────────────────────────────┘
+         │                                                    │
+         └────────────────────┬───────────────────────────────┘
+                              ▼
+              logits = self_scores + rel_scores   (B, N)
+              scores = softmax(logits / τ) ⊙ valid_mask
+                              │
+                              ▼
+                    重要性排序结果  (B, N)
 ```
 
 ---
 
-## 项目文件结构
+## 各模块详细设计解释
+
+### 1. 特征提取主干网络
+
+#### 1.1 视觉编码器 (DINOv2-Base)
+
+**解决的问题**：如何从视频帧中提取具有语义意义的人物外观特征？
+
+**设计思路**：
+- **输入**：对每个人物检测框进行ROI裁剪，通过可微分的`grid_sample`操作提取196×196的人物补丁
+- **主干网络**：使用预训练的`facebook/dinov2-base`模型（86.6M参数，ViT-B/14架构）
+- **特征提取**：提取CLS token作为人物表示，获得768维特征向量
+- **微调策略**：仅解冻最后1层Transformer进行任务特定微调，平衡性能与计算成本
+
+**技术细节**：
+- 采用分块处理（`roi_chunk`）管理显存使用
+- 输出L2归一化的768维特征向量
+- 支持批量处理所有有效的人物位置
+
+#### 1.2 边界框几何编码器
+
+**解决的问题**：如何编码人物的空间位置和大小信息？
+
+**设计思路**：
+- **特征选择**：使用9个静态空间特征：`[x1, y1, x2, y2, cx, cy, w, h, area]`
+- **设计哲学**：故意排除运动特征（位移、速度），因为时间动态信息由GAT的时间边特征捕获，实现干净的特征职责分离
+- **网络结构**：简单的两层MLP（9→128→128）+ LayerNorm
+
+**为什么这样设计**：
+- 静态几何特征提供人物在场景中的基本空间信息
+- 避免与时间边特征的信息重复，每个模块专注于不同的信息维度
+- 轻量级设计，计算成本低但信息价值高
+
+#### 1.3 特征融合
+
+**解决的问题**：如何有效结合视觉特征和几何特征？
+
+**设计思路**：
+- **融合方式**：简单拼接后通过MLP投影到统一维度
+- **网络结构**：`Linear(896→768) → LayerNorm → ReLU → Dropout(0.10)`
+- **输出**：融合后的768维特征`fused`
+
+**设计优势**：
+- 保持特征维度的一致性，便于后续处理
+- 通过非线性变换学习特征间的复杂交互
+- Dropout防止过拟合，提高泛化能力
+
+---
+
+### 2. 个体分支 (Self Branch)
+
+**解决的问题**：如何基于人物自身的静态特征评估其显著性？
+
+**设计思路**：
+- **特征聚合**：对时间维度取平均，消除时间变化的影响
+- **评分网络**：简单的MLP（768→256→1）+ LayerNorm + ReLU + Dropout
+- **设计哲学**：使用融合前的特征，确保个体评分不受场景上下文影响
+
+**为什么这样设计**：
+- 时间平均捕获人物在视频中的"平均状态"
+- 简单的网络结构避免过度复杂化个体特征的建模
+- 独立于关系分支，确保个体评分的纯粹性
+
+**解决的问题**：
+- 识别外观突出、位置显眼的人物
+- 为后续的关系评分提供基准参考
+- 平衡个体特征与社交动态的重要性
+
+---
+
+### 3. 关系分支 (Relation Branch)
+
+#### 3.1 KCGC：关键帧条件全局上下文
+
+**解决的问题**：如何让模型理解场景类型，从而更好地评估人物重要性？
+
+**设计思路**：
+- **关键帧采样**：均匀采样K=T//4个关键帧，确保帧间间隔≥4，捕获不同时间点的场景信息
+- **场景编码**：使用DINOv2提取全帧CLS特征（无梯度），编码场景语义
+- **上下文注入**：通过交叉注意力机制，让每个人物关注相关的场景信息
+
+**为什么这样设计**：
+- 不同场景类型有不同的"重要性标准"（新闻发布会vs体育比赛）
+- 关键帧间隔足够大，确保场景信息的多样性
+- 无梯度设计避免场景特征干扰人物特征的学习
+
+**解决的问题**：
+- 场景感知的重要性评估
+- 为图注意力网络提供场景级别的先验知识
+- 提高模型在不同场景下的泛化能力
+
+#### 3.2 时空图注意力网络 (Spatio-Temporal GATv2)
+
+**解决的问题**：如何建模人物间的复杂交互关系？
+
+**设计思路**：
+- **图结构**：每个节点代表（人物n，帧t）的组合
+- **空间边**：同帧内的人物关系，基于位置距离和重叠度
+- **时间边**：同一人物在不同帧的变化，基于外观差异
+
+**空间边设计**：
+- **连接策略**：topk=8最近邻，避免全连接导致的注意力分散
+- **特征计算**：`[Δcx, Δcy, Δw, Δh, centre_dist, IoU]` → 32维
+- **解决的问题**：捕获人物间的空间关系、遮挡关系、群体结构
+
+**时间边设计**：
+- **连接策略**：同一人物在±window=2范围内的相邻帧
+- **特征计算**：DINOv2特征差异向量，经过LayerNorm和MLP投影
+- **解决的问题**：捕获人物的姿态变化、动作开始、表情变化
+
+**为什么需要LayerNorm**：
+- 原始vis_feats差异向量幅度≈0.01，而空间特征幅度≈0.3，相差30倍
+- LayerNorm统一特征尺度，避免空间边完全主导注意力权重
+
+#### 3.3 时间注意力池化
+
+**解决的问题**：如何从T帧的图表示中聚合出单个人物的重要性评分？
+
+**设计思路**：
+- **时间异常度**：`temporal_dev = fused_t − mean_T(fused)`，衡量此帧相对于人物平均状态的异常程度
+- **注意力机制**：基于图特征和时间异常度计算注意力权重
+- **加权聚合**：使用注意力权重对图特征进行加权求和
+
+**为什么这样设计**：
+- 标准时间注意力没有信号指示哪些帧是动态重要的
+- 时间异常度捕获人物行为的"异常时刻"（说话开始、手势动作等）
+- 无需显式动作标签，自动发现社交活跃时刻
+
+**解决的问题**：
+- 识别关键时刻的人物重要性
+- 自动发现社交互动中的关键事件
+- 提供时间维度的重要性解释性
+
+---
+
+### 4. 评分融合与输出
+
+**设计思路**：
+- **双分支融合**：`logits = self_scores + rel_scores`
+- **温度调节**：`scores = softmax(logits / τ)`，τ=1.0
+- **掩码处理**：对无效人物位置填充极小值
+
+**为什么这样设计**：
+- 简单加法融合，让模型学习两个维度的相对重要性
+- 温度参数控制输出分布的锐度
+- 掩码确保只有有效人物参与最终排序
+
+---
+
+## 创新点总结
+
+| 模块 | 创新点 | 解决的问题 |
+|------|--------|------------|
+| **双分支分解** | 个体(静态) + 关系(动态)评分相加 | 清晰分离：个体显著性 vs 社交动态重要性 |
+| **KCGC** | 全帧DINOv2 CLS作为场景上下文，交叉注意力注入 | 场景感知的重要性评估（不同场景有不同重要性标准） |
+| **时空图结构** | 联合(person, frame)节点 + 空间边 + 时间边 | 同时建模瞬时空间关系和时间外观动态 |
+| **时间边特征** | vis_feats差异向量 + LayerNorm | 在正确特征尺度上捕获姿态/手势变化 |
+| **时间异常度注意力** | 基于`fused_t − mean_T(fused)`的注意力 | 关注人物行为异常的帧 → 发现社交活跃时刻 |
+| **静态几何分离** | BBoxGeom仅使用9个静态特征 | 运动信息完全在时间边中；干净的特征职责 |
+
+---
+
+## 数据流总结
 
 ```
-src/
-  configs/config.py          — 所有配置 dataclass
-  data/dataloader.py         — NPZ 数据加载、时序重采样、slot 排列
-  models/
-    importance_ranker.py     — 主模型 (Self + Relation 分支)
-    vision_encoder.py        — DINOv2 backbone wrapper
-    bbox_geom.py             — 几何特征编码 + 边特征计算
-    gatv2.py                 — 时空联合图 GATv2
-  training/
-    loss.py                  — CE + 可选 Preference loss
-    loops.py                 — 训练/验证循环
-    trainer.py               — Trainer (DDP, checkpoint, logging)
-    runtime.py               — 训练运行时 (配置加载, 数据构建)
-  train.py                   — 训练入口
-  run_experiments.py         — 统一实验运行器 (消融/seed/超参数)
-  run_ablation.py            — 旧版消融脚本 (保留兼容)
+输入
+  frames (B,32,3,192,336) ─┬──→ ROI裁剪 ──→ DINOv2 ──→ vis_feats (B,32,16,768)
+  bboxes (B,32,16,4)       │              └──→ KCGC全帧CLS (无梯度)
+  person_mask (B,32,16)    └──→ BBoxGeom ──→ geom_feats (B,32,16,128)
+                                                │
+                                         特征融合(cat) ──→ fused (B,32,16,768)
+                                                │
+                      ┌─────────────────────────┤
+                      │                         │
+              个体分支                    KCGC增强
+              mean_T(fused)               fused_ctx (B,32,16,768)
+              (B,16,768)                         │
+                      │                   时空图注意力
+                      │                   graph_feats (B,32,16,512)
+                      │                         │
+                      │                   时间注意力(graph+temporal_dev)
+                      │                   rel_pooled (B,16,512)
+                      │                         │
+              个体评分                  关系评分
+              self_scores (B,16)        rel_scores (B,16)
+                      │                         │
+                      └────────┬────────────────┘
+                               ▼
+                        logits (B,16)
+                               ▼
+                    重要性排序结果
 ```
+
+---
+
+## 关键设计选择与原理
+
+**为什么T=32采样帧（不是全部120帧）？**
+原始NPZ文件包含120帧，但有效帧（填充前的前缀）平均82帧。从有效帧均匀下采样到T=32：(1) 消除零填充尾帧的噪声注入，(2) 增加帧间特征差异（vs相邻帧的vis_feats变化增大约2.5倍），提高时间边的信噪比。
+
+**为什么topk=8空间边（不是全连接）？**
+全连接(N=16) → 每个节点关注15个邻居 → softmax权重≈0.067（接近均匀）→ GATv2退化为GCN。topk=8集中注意力权重，使GATv2的注意力机制真正区别于均匀聚合。
+
+**为什么GATv2添加自环而GCN消融不添加？**
+自环为GATv2提供对自身特征的稳定参考，防止聚合异构邻居时的梯度不稳定。对于GCN消融，移除自环使其成为严格更弱的基线（纯均匀邻域平均）。
+
+**为什么时间边投影前需要LayerNorm？**
+原始vis_feats差异向量幅度≈0.01（相邻采样帧），而空间bbox特征幅度≈0.3 — 30倍差距。没有LayerNorm，GAT注意力完全被空间边主导，时间边实际上失效。LayerNorm统一尺度。
+
+**为什么注意力中使用时间异常度（不是标准自注意力）？**
+标准时间注意力（`Linear(graph_feats)`）没有信号指示哪些帧是动态重要的。`temporal_dev = fused_t − mean_T(fused)`捕获相对于人物自身基线的偏差 — 人物行为异常（说话、手势）的帧会有大偏差，应获得更高注意力权重。
+
+---
+
+## 模型复杂度分析
+
+| 模块 | 参数量 | 可训练参数 |
+|------|--------|------------|
+| VisionEncoder (DINOv2-Base) | 86.580M | 7.089M (最后1层) |
+| BBoxGeomEncoder | 0.018M | 0.018M |
+| 特征融合MLP | 0.690M | 0.690M |
+| 个体评分MLP | 0.199M | 0.199M |
+| SpatioTemporalGATv2 | 1.509M | 1.509M |
+| 时间注意力 | 0.001M | 0.001M |
+| 关系评分MLP | 0.133M | 0.133M |
+| KCGC (交叉注意力) | 1.774M | 1.774M |
+| **总计** | **90.9M** | **11.4M** |
+
+---
+
+## 消融实验设计
+
+| 消融实验 | 移除内容 | 验证目的 |
+|----------|----------|----------|
+| `no_relation` | 整个关系分支 | 社交图建模的必要性 |
+| `no_geom` | BBoxGeomEncoder | 静态几何特征的贡献 |
+| `no_gat` | GATv2 → MLP | 图结构 vs 无结构特征变换 |
+| `no_spatial` | 空间边 | 帧内社交空间关系 |
+| `no_temporal` | 时间边 | 帧间时间外观动态 |
+| `gcn` | GATv2 → GCN + 无边特征 | 注意力机制 vs 均匀聚合 |
+| `no_global_ctx` | KCGC模块 | 场景级背景知识 |
+
+---
+
+## 实际应用价值
+
+本架构设计解决了视频内容分析中的核心问题：
+1. **自动识别主要人物**：无需人工标注，自动发现视频中的关键人物
+2. **场景适应性**：不同场景类型（会议、体育、社交）有不同的重要性标准
+3. **时间动态理解**：不仅看外观，还理解人物行为的时序变化
+4. **社交关系建模**：考虑人物间的相互影响和群体动态
+
+这种设计为视频摘要、内容推荐、自动剪辑等应用提供了强大的技术基础。

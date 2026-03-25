@@ -7,18 +7,22 @@ import torch.nn as nn
 
 
 class BBoxGeomEncoder(nn.Module):
-    """Encode (x1,y1,x2,y2) + area + center + frame-to-frame displacement.
+    """Encode static spatial features from (x1,y1,x2,y2).
 
     Input:
         bboxes: (B,T,N,4) normalized
         person_mask: (B,T,N)
     Output:
         geom: (B,T,N,D)
+
+    Note: temporal motion features (dcx/dcy/disp/speed/accel) are intentionally
+    excluded — motion information is exclusively carried by GAT temporal edge features,
+    achieving clean separation of responsibilities.
     """
 
     def __init__(self, out_dim: int = 128, hidden_dim: int = 128) -> None:
         super().__init__()
-        in_dim = 14
+        in_dim = 9
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -34,18 +38,7 @@ class BBoxGeomEncoder(nn.Module):
         cy = (y1 + y2) * 0.5
         area = w * h
 
-        dcx = torch.zeros_like(cx)
-        dcy = torch.zeros_like(cy)
-        dcx[:, 1:] = cx[:, 1:] - cx[:, :-1]
-        dcy[:, 1:] = cy[:, 1:] - cy[:, :-1]
-        disp = (dcx.square() + dcy.square()).sqrt()
-
-        speed = disp
-        accel = torch.zeros_like(speed)
-        accel[:, 1:] = speed[:, 1:] - speed[:, :-1]
-        accel = accel.abs()
-
-        feats = torch.stack([x1, y1, x2, y2, cx, cy, w, h, area, dcx, dcy, disp, speed, accel], dim=-1)
+        feats = torch.stack([x1, y1, x2, y2, cx, cy, w, h, area], dim=-1)
         out = self.mlp(feats)
         out = out.masked_fill(~person_mask.unsqueeze(-1), 0.0)
         return out
