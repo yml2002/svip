@@ -9,8 +9,8 @@ from typing import Optional
 @dataclass
 class DataConfig:
     data_dir: str = "data/shared_data/preprocessed_fixed"
-    train_splits: list[str] = field(default_factory=lambda: ["train", "test"])
-    # train_splits: list[str] = field(default_factory=lambda: ["train"])
+    # train_splits: list[str] = field(default_factory=lambda: ["train", "test"])
+    train_splits: list[str] = field(default_factory=lambda: ["train"])
     val_split: str = "val"
     video_length: int = 120       # raw frames per NPZ (fixed by dataset)
     sampled_frames: int = 32      # frames after valid-frame extraction + uniform downsample
