@@ -18,6 +18,17 @@ class DataConfig:
     cache_data: bool = False
     max_samples: Optional[int] = None
     data_ratio: float = 1.0
+    augmentation: "AugmentationConfig" = field(default_factory=lambda: AugmentationConfig())
+
+
+@dataclass
+class AugmentationConfig:
+    enabled: bool = True
+    horizontal_flip_prob: float = 0.5
+    brightness: float = 0.12
+    contrast: float = 0.12
+    saturation: float = 0.10
+    noise_std: float = 0.02
 
 
 @dataclass
@@ -31,10 +42,10 @@ class DropoutConfig:
 @dataclass
 class BBoxGeomConfig:
     enabled: bool = True
-    feature_dim: int = 128
-    hidden_dim: int = 128
-    spatial_edge_dim: int = 32
-    temporal_edge_dim: int = 32   # projection bottleneck before matching spatial_edge_dim
+    feature_dim: int = 64
+    hidden_dim: int = 64
+    fuse_scale: float = 1.0
+    dropout_prob: float = 0.0
 
 
 @dataclass
@@ -62,7 +73,6 @@ class GATv2Config:
     num_layers: int = 2
     heads: int = 4
     topk_neighbors: int = 8
-    temporal_window: int = 2
     use_spatial_edges: bool = True
     use_temporal_edges: bool = True
     use_edge_features: bool = True
@@ -71,39 +81,51 @@ class GATv2Config:
 @dataclass
 class ScoringConfig:
     hidden_dim: int = 256
-    temperature: float = 1.0
 
 
 @dataclass
-class SelfBranchConfig:
-    enabled: bool = True
+class IntrinsicConfig:
+    use_motion_priors: bool = True
+    use_max_pool: bool = True
+    use_attention_pool: bool = True
 
 
 @dataclass
 class RelationConfig:
     enabled: bool = True
+    delta_scale: float = 0.85
+    use_adaptive_gate: bool = True
+
+
+@dataclass
+class CounterfactualConfig:
+    enabled: bool = True
+    relation_weight: float = 0.20
+    scene_weight: float = 0.12
+    relation_margin: float = 0.15
+    scene_margin: float = 0.08
 
 
 @dataclass
 class LossConfig:
     beta: float = 1.0
     importance_weight: float = 1.0
-    preference_weight: float = 0.0
+    preference_weight: float = 0.25
+    intrinsic_aux_weight: float = 0.20
+    relation_aux_weight: float = 0.20
+    scene_consistency_weight: float = 0.10
 
 
 @dataclass
 class GlobalContextConfig:
-    """Keyframe-Conditioned Global Context (KCGC).
-
-    Uniformly samples `num_keyframes` from the T-frame video, encodes each
-    full frame with DINOv2 (detached, no gradient to backbone), then each
-    person cross-attends to keyframe features for person-specific context.
-    """
+    """Open-world scene context extracted from keyframes."""
     enabled: bool = True
     num_keyframes: int = 8
     context_dim: int = 256
     num_heads: int = 4
+    num_layers: int = 1
     dropout: float = 0.15
+    num_prototypes: int = 8
 
 
 @dataclass
@@ -112,26 +134,29 @@ class ModelConfig:
     features: FeatureConfig = field(default_factory=FeatureConfig)
     gatv2: GATv2Config = field(default_factory=GATv2Config)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
-    self_branch: SelfBranchConfig = field(default_factory=SelfBranchConfig)
+    intrinsic: IntrinsicConfig = field(default_factory=IntrinsicConfig)
     relation: RelationConfig = field(default_factory=RelationConfig)
+    counterfactual: CounterfactualConfig = field(default_factory=CounterfactualConfig)
     global_context: GlobalContextConfig = field(default_factory=GlobalContextConfig)
     loss: LossConfig = field(default_factory=LossConfig)
 
 
 @dataclass
 class TrainingConfig:
-    learning_rate: float = 5e-5
-    backbone_lr_scale: float = 1.0
+    learning_rate: float = 1e-4
+    backbone_lr_scale: float = 0.05
     weight_decay: float = 5e-4
     betas: tuple = (0.9, 0.999)
     min_lr: float = 1e-5
+    backbone_warmup_epochs: int = 1
+    backbone_train_mode: str = "attn_ln"
 
     seed: int = 2026
 
     num_epochs: int = 15
     batch_size: int = 64
     accumulation_steps: int = 1
-    roi_chunk: int = 16384
+    roi_chunk: int = 32768
     export_train_predictions: bool = False
 
     use_mixed_precision: bool = True

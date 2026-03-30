@@ -115,12 +115,6 @@ class OutputManager:
             writer = csv.DictWriter(f, fieldnames=header)
             writer.writerow({k: flat.get(k) for k in header})
 
-    def log_epoch(self, payload: Dict[str, Any]) -> None:
-        if self.records_dir is None or self._csv_path is None or self._json_path is None:
-            return
-
-        self.log_metrics(payload)
-
     def export_predictions_csv(
         self,
         *,

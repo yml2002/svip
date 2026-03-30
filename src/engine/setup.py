@@ -205,6 +205,10 @@ class TrainingRuntime:
             config.model.loss.importance_weight = float(self.args.importance_weight)
         if getattr(self.args, "preference_weight", None) is not None:
             config.model.loss.preference_weight = float(self.args.preference_weight)
+        if getattr(self.args, "relation_delta_scale", None) is not None:
+            config.model.relation.delta_scale = float(self.args.relation_delta_scale)
+        if bool(getattr(self.args, "no_counterfactual", False)):
+            config.model.counterfactual.enabled = False
         if bool(getattr(self.args, "no_gat", False)):
             config.model.gatv2.enabled = False
         if bool(getattr(self.args, "no_spatial_edges", False)):
@@ -215,35 +219,32 @@ class TrainingRuntime:
             config.model.gatv2.use_edge_features = False
         if bool(getattr(self.args, "no_geom", False)):
             config.model.features.bbox_geom.enabled = False
-        if getattr(self.args, "graph_type", None) is not None:
-            config.model.gatv2.graph_type = str(self.args.graph_type)
+        if bool(getattr(self.args, "mean_only_unary", False)):
+            config.model.intrinsic.use_max_pool = False
+            config.model.intrinsic.use_attention_pool = False
         if getattr(self.args, "gat_topk_neighbors", None) is not None:
             topk = int(self.args.gat_topk_neighbors)
             if topk < 0:
                 raise ValueError(f"gat_topk_neighbors must be >= 0, got {topk}")
             config.model.gatv2.topk_neighbors = topk
-        if getattr(self.args, "gat_num_layers", None) is not None:
-            config.model.gatv2.num_layers = int(self.args.gat_num_layers)
-        if getattr(self.args, "gat_heads", None) is not None:
-            config.model.gatv2.heads = int(self.args.gat_heads)
-        if getattr(self.args, "temporal_window", None) is not None:
-            config.model.gatv2.temporal_window = int(self.args.temporal_window)
-        if getattr(self.args, "self_enabled", None) is not None:
-            config.model.self_branch.enabled = bool(int(self.args.self_enabled))
         if getattr(self.args, "relation_enabled", None) is not None:
             config.model.relation.enabled = bool(int(self.args.relation_enabled))
         if getattr(self.args, "unfreeze_layers", None) is not None:
             config.model.features.dino.unfreeze_layers = int(self.args.unfreeze_layers)
-        if getattr(self.args, "logit_temperature", None) is not None:
-            config.model.scoring.temperature = float(self.args.logit_temperature)
         if getattr(self.args, "backbone_lr_scale", None) is not None:
             config.training.backbone_lr_scale = float(self.args.backbone_lr_scale)
+        if getattr(self.args, "backbone_warmup_epochs", None) is not None:
+            config.training.backbone_warmup_epochs = int(self.args.backbone_warmup_epochs)
+        if getattr(self.args, "backbone_train_mode", None) is not None:
+            config.training.backbone_train_mode = str(self.args.backbone_train_mode)
 
-        # Global context (KCGC)
+        # Open-world scene context
         if bool(getattr(self.args, "no_global_context", False)):
             config.model.global_context.enabled = False
         if getattr(self.args, "global_num_keyframes", None) is not None:
             config.model.global_context.num_keyframes = int(self.args.global_num_keyframes)
+        if getattr(self.args, "global_num_prototypes", None) is not None:
+            config.model.global_context.num_prototypes = int(self.args.global_num_prototypes)
 
         config.training.distributed = self.is_distributed
         config.training.world_size = self.world_size
@@ -258,11 +259,7 @@ class TrainingRuntime:
     def _build_trainer(self) -> None:
         assert self.config is not None
 
-        train_ds, val_ds = build_train_val_datasets(
-            self.config,
-            swap_splits=bool(getattr(self.args, "swap_splits", False)),
-            swap_fraction=float(getattr(self.args, "swap_fraction", 0.5)),
-        )
+        train_ds, val_ds = build_train_val_datasets(self.config)
 
         train_sampler = DistributedSampler(train_ds, shuffle=True) if self.is_distributed else None
         val_sampler = DistributedSampler(val_ds, shuffle=False) if self.is_distributed else None
@@ -303,15 +300,13 @@ class TrainingRuntime:
         backbone_params = []
         head_params = []
         for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
             (backbone_params if "vision.backbone" in name else head_params).append(p)
 
         param_groups = []
         if backbone_params:
-            param_groups.append({"params": backbone_params, "lr": backbone_lr})
+            param_groups.append({"params": backbone_params, "lr": backbone_lr, "group_name": "backbone"})
         if head_params:
-            param_groups.append({"params": head_params, "lr": base_lr})
+            param_groups.append({"params": head_params, "lr": base_lr, "group_name": "head"})
 
         if backbone_lr_scale != 1.0:
             self.logger.info(

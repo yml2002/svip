@@ -102,6 +102,32 @@ class Trainer:
         if self.checkpoint_dir is not None:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    def _model_ref(self) -> nn.Module:
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    def _apply_finetune_stage(self, epoch: int) -> None:
+        model_ref = self._model_ref()
+        if hasattr(model_ref, "configure_train_stage"):
+            model_ref.configure_train_stage(epoch)
+        if not self._is_main_process():
+            return
+        backbone_total = 0
+        backbone_trainable = 0
+        for name, p in model_ref.named_parameters():
+            if "vision.backbone" not in name:
+                continue
+            backbone_total += int(p.numel())
+            if p.requires_grad:
+                backbone_trainable += int(p.numel())
+        if backbone_total > 0:
+            logger.info(
+                "Epoch %d: backbone_trainable=%d/%d (%.2f%%)",
+                int(epoch),
+                int(backbone_trainable),
+                int(backbone_total),
+                100.0 * float(backbone_trainable) / float(backbone_total),
+            )
+
     def _is_main_process(self) -> bool:
         return self.rank == 0
 
@@ -112,7 +138,7 @@ class Trainer:
                 out[k] = v
                 continue
 
-            if k in {"frames", "bboxes", "person_mask", "target_index", "scene_category_idx"}:
+            if k in {"frames", "bboxes", "person_mask", "target_index"}:
                 out[k] = v.to(self.device, non_blocking=True)
             else:
                 out[k] = v
@@ -134,11 +160,11 @@ class Trainer:
         if self.checkpoint_dir is None or not self._is_main_process():
             return
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
-        trainable_state = {n: p.detach().cpu() for n, p in model_ref.named_parameters() if p.requires_grad}
+        model_state = {k: v.detach().cpu() for k, v in model_ref.state_dict().items()}
         payload: Dict[str, Any] = {
             "epoch": int(self.current_epoch),
             "global_step": int(self.global_step),
-            "model_trainable": trainable_state,
+            "model": model_state,
             "optimizer": self.optimizer.state_dict(),
             "metrics": {
                 "train_loss": float(train_loss),
@@ -178,14 +204,15 @@ class Trainer:
             # Public-facing epoch numbers are 1-based (src-ref behavior).
             # Internally we keep current_epoch 0-based to avoid breaking checkpoint fields.
             self.current_epoch = epoch - 1
+            self._apply_finetune_stage(epoch)
 
             train_sampler = getattr(self.train_dataloader, "sampler", None)
             if self.is_distributed and hasattr(train_sampler, "set_epoch"):
                 train_sampler.set_epoch(epoch)
 
             t_epoch0 = time.perf_counter() if self._is_main_process() else 0.0
-            train_loss, train_acc, train_imp_loss, train_pref_loss, train_diag = train_epoch(self, log_every=10)
-            val_loss, val_acc, r1, r2, r3, val_imp_loss, val_pref_loss, val_diag = validate_epoch(self, log_every=10)
+            train_loss, train_acc, train_imp_loss, train_pref_loss, train_diag = train_epoch(self)
+            val_loss, val_acc, r1, r2, r3, val_imp_loss, val_pref_loss, val_diag = validate_epoch(self)
             t_epoch1 = time.perf_counter() if self._is_main_process() else 0.0
 
             train_losses.append(train_loss)
@@ -380,5 +407,3 @@ class Trainer:
                     break
             if (not self.is_distributed) and early_stop_patience is not None and should_stop:
                 break
-
-

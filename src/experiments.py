@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Unified experiment runner for CVPR submission.
+"""Unified experiment runner for CVPR-style experiments.
 
 Modes:
   all         — run ablation + seed + hyperparam in sequence
-  ablation    — ablation study (7 experiments, each removes one design component)
+  ablation    — task-driven mechanism ablations for the paper model
   seed        — multi-seed stability (full model × 3 seeds)
-  hyperparam  — hyperparameter sensitivity (6 params, 20 configs)
+  hyperparam  — hyperparameter sensitivity for meaningful design knobs
 
 Usage:
   # Run ALL experiments at once
@@ -16,8 +16,8 @@ Usage:
 
   # Run specific mode
   python src/experiments.py ablation --batch_size 32 --num_epochs 15
-  python src/experiments.py seed --experiments full --seeds 42,3407,2026
-  python src/experiments.py hyperparam --experiments lr_1e5,lr_5e5,lr_1e4
+  python src/experiments.py seed --experiments full_model --seeds 42,3407,2026
+  python src/experiments.py hyperparam --experiments topk_4,topk_8,topk_all
 
   # Multi-GPU
   python src/experiments.py all --nproc_per_node 7 --batch_size 32 --num_epochs 15
@@ -38,20 +38,28 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # ============================================================
-# Ablation: 7 experiments — each removes one independent design decision
+# Ablation: only task-driven mechanism studies used in the paper
 # ============================================================
 ABLATION_CONFIGS = {
-    "full":          {},                                    # Complete model
-    "no_relation":   {"--relation_enabled": "0"},          # Remove relation branch (self branch only)
-    "no_geom":       {"--no_geom": None},                  # Remove BBoxGeomEncoder
-    "no_gat":        {"--no_gat": None},                   # Replace GAT with MLP (no graph structure)
-    "no_spatial":    {"--no_spatial_edges": None},          # Remove spatial edges (GAT temporal-only)
-    "no_temporal":   {"--no_temporal_edges": None},        # Remove temporal edges (GAT spatial-only)
-    "gcn":           {"--graph_type": "gcn",               # GATv2→GCN (also disables edge features, GCN doesn't support them)
-                      "--no_edge_features": None},
-    "no_global_ctx": {"--no_global_context": None},        # Remove KCGC
+    "full_model":                           {},
+    "wo_counterfactual_regularization": {"--no_counterfactual": None},
+    "wo_relation_refinement":          {"--relation_enabled": "0"},
+    "wo_scene_context_conditioning":   {"--no_global_context": None},
+    "wo_temporal_social_memory":       {"--no_temporal_edges": None},
+    "wo_spatial_social_interaction":   {"--no_spatial_edges": None},
+    "wo_dynamic_unary_prior":          {"--mean_only_unary": None},
+    "wo_geometry_prior":               {"--no_geom": None},
 }
-ABLATION_ORDER = ["full", "no_temporal", "gcn", "no_global_ctx", "no_relation", "no_geom", "no_gat", "no_spatial"]
+ABLATION_ORDER = [
+    "full_model",
+    "wo_counterfactual_regularization",
+    "wo_relation_refinement",
+    "wo_scene_context_conditioning",
+    "wo_temporal_social_memory",
+    "wo_spatial_social_interaction",
+    "wo_dynamic_unary_prior",
+    "wo_geometry_prior",
+]
 
 # ============================================================
 # Multi-seed: full model × 3 seeds
@@ -59,47 +67,27 @@ ABLATION_ORDER = ["full", "no_temporal", "gcn", "no_global_ctx", "no_relation", 
 DEFAULT_SEEDS = [42, 3407, 2026]
 
 # ============================================================
-# Hyperparameter sensitivity: 6 params × 3-5 values = 20 configs
+# Hyperparameter sensitivity: only the four paper-worthy groups
 # ============================================================
 HYPERPARAM_CONFIGS = {
-    # GAT layers: {1, 2*, 3}
-    "gat_layers_1":  {"--gat_num_layers": "1"},
-    "gat_layers_2":  {},
-    "gat_layers_3":  {"--gat_num_layers": "3"},
-    # GAT heads: {2, 4*, 8}
-    "gat_heads_2":   {"--gat_heads": "2"},
-    "gat_heads_4":   {},
-    "gat_heads_8":   {"--gat_heads": "8"},
-    # Temporal window: {1, 3*, 5}
-    "tw_1":          {"--temporal_window": "1"},
-    "tw_3":          {},
-    "tw_5":          {"--temporal_window": "5"},
-    # TopK neighbors: {2, 4*, all}
-    "topk_2":        {"--gat_topk_neighbors": "2"},
-    "topk_4":        {},
-    "topk_all":      {"--gat_topk_neighbors": "0"},
-    # Learning rate: log-uniform {1e-5, 2e-5, 5e-5*, 1e-4, 2e-4}
-    "lr_1e5":        {"--learning_rate": "1e-5"},
-    "lr_2e5":        {"--learning_rate": "2e-5"},
-    "lr_5e5":        {},
-    "lr_1e4":        {"--learning_rate": "1e-4"},
-    "lr_2e4":        {"--learning_rate": "2e-4"},
-    # DINOv2 unfreeze: {0(frozen), 1*(default)}
-    "unfreeze_0":    {"--unfreeze_layers": "0"},
-    "unfreeze_1":    {},
-    # KCGC keyframes: {4, 8*, 16}
-    "kf_4":          {"--global_num_keyframes": "4"},
-    "kf_8":          {},
-    "kf_16":         {"--global_num_keyframes": "16"},
+    "topk_4":              {"--gat_topk_neighbors": "4"},
+    "topk_8":              {},
+    "topk_all":            {"--gat_topk_neighbors": "0"},
+    "delta_050":           {"--relation_delta_scale": "0.50"},
+    "delta_085":           {},
+    "delta_120":           {"--relation_delta_scale": "1.20"},
+    "pref_000":            {"--preference_weight": "0.00"},
+    "pref_025":            {},
+    "pref_050":            {"--preference_weight": "0.50"},
+    "unfreeze_0":          {"--unfreeze_layers": "0"},
+    "unfreeze_1":          {"--unfreeze_layers": "1"},
+    "unfreeze_2":          {"--unfreeze_layers": "2"},
 }
 HYPERPARAM_ORDER = [
-    "gat_layers_1", "gat_layers_2", "gat_layers_3",
-    "gat_heads_2", "gat_heads_4", "gat_heads_8",
-    "tw_1", "tw_3", "tw_5",
-    "topk_2", "topk_4", "topk_all",
-    "lr_1e5", "lr_2e5", "lr_5e5", "lr_1e4", "lr_2e4",
-    "unfreeze_0", "unfreeze_1",
-    "kf_4", "kf_8", "kf_16",
+    "topk_4", "topk_8", "topk_all",
+    "delta_050", "delta_085", "delta_120",
+    "pref_000", "pref_025", "pref_050",
+    "unfreeze_0", "unfreeze_1", "unfreeze_2",
 ]
 
 
@@ -130,6 +118,13 @@ def parse_args():
                    help=f"ROI crop chunk size (config default: {tr.roi_chunk})")
     p.add_argument("--early_stop", type=int, default=None,
                    help=f"early-stop patience epochs (config default: {tr.early_stop})")
+    p.add_argument("--backbone_lr_scale", type=float, default=None,
+                   help=f"backbone LR scale (config default: {tr.backbone_lr_scale})")
+    p.add_argument("--backbone_warmup_epochs", type=int, default=None,
+                   help=f"backbone warmup epochs (config default: {tr.backbone_warmup_epochs})")
+    p.add_argument("--backbone_train_mode", type=str, default=None,
+                   choices=["frozen", "attn_ln", "full_block"],
+                   help=f"backbone train mode (config default: {tr.backbone_train_mode})")
     p.add_argument("--seed", type=int, default=None,
                    help=f"Random seed (config default: {tr.seed})")
     p.add_argument("--seeds", type=str, default=None,
@@ -160,10 +155,15 @@ def build_command(args, extra_flags: dict, output_dir: str, seed: int) -> list[s
         "--num_workers":       args.num_workers,
         "--roi_chunk":         args.roi_chunk,
         "--early_stop":        args.early_stop,
+        "--backbone_lr_scale": args.backbone_lr_scale,
+        "--backbone_warmup_epochs": args.backbone_warmup_epochs,
     }
     for flag, value in optional.items():
         if value is not None:
             train_args += [flag, str(value)]
+
+    if args.backbone_train_mode is not None:
+        train_args += ["--backbone_train_mode", str(args.backbone_train_mode)]
 
     for flag, value in extra_flags.items():
         train_args.append(flag)
@@ -277,7 +277,7 @@ def run_one(args, name: str, flags: dict, out_dir: Path, seed: int) -> dict:
     )
     return {"status": "OK", "time_seconds": dt, **m}
 
-def print_table(results: dict, order: list, ref_key: str = "full"):
+def print_table(results: dict, order: list, ref_key: str = "full_model"):
     ref_r1 = results.get(ref_key, {}).get("best_rank1", 0)
     print(f"\n{'='*80}")
     print(f"{'Experiment':<16} {'Status':<8} {'Rank@1':>8} {'Rank@2':>8} {'Rank@3':>8} {'Ep':>4} {'Time':>7}")
@@ -330,7 +330,7 @@ def do_ablation(args, root: Path):
 # ============================================================
 def do_seed(args, root: Path):
     seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else DEFAULT_SEEDS
-    experiments = [e.strip() for e in args.experiments.split(",")] if args.experiments else ["full"]
+    experiments = [e.strip() for e in args.experiments.split(",")] if args.experiments else ["full_model"]
 
     print(f"\n{'#'*60}")
     print(f"# MULTI-SEED: {len(experiments)} exp × {len(seeds)} seeds")

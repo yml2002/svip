@@ -25,6 +25,9 @@ class VisionEncoder(nn.Module):
         super().__init__()
         self.image_size = int(image_size)
         self.model_dir = str(model_dir)
+        self.initial_freeze = bool(freeze)
+        self.unfreeze_layers = int(max(0, unfreeze_layers))
+        self._stage_signature: Optional[tuple[int, int, str]] = None
 
         if not self.model_dir:
             raise ValueError(
@@ -58,20 +61,53 @@ class VisionEncoder(nn.Module):
         else:
             self.out_dim = self.backbone_dim
 
-        if freeze or unfreeze_layers == 0:
-            # Freeze entire backbone
-            for p in self.backbone.parameters():
-                p.requires_grad = False
-        if not freeze and unfreeze_layers > 0:
-            # Freeze all, then unfreeze the last N transformer layers
-            for p in self.backbone.parameters():
-                p.requires_grad = False
-            if hasattr(self.backbone, 'encoder') and hasattr(self.backbone.encoder, 'layer'):
-                layers = self.backbone.encoder.layer
-                num_layers = len(layers)
-                for i in range(max(0, num_layers - unfreeze_layers), num_layers):
-                    for p in layers[i].parameters():
-                        p.requires_grad = True
+        self.freeze_backbone()
+        if (not self.initial_freeze) and self.unfreeze_layers > 0:
+            self.apply_finetune_mode(self.unfreeze_layers, mode="full_block")
+
+    def freeze_backbone(self) -> None:
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+    def _encoder_layers(self):
+        if hasattr(self.backbone, "encoder") and hasattr(self.backbone.encoder, "layer"):
+            return list(self.backbone.encoder.layer)
+        return []
+
+    def apply_finetune_mode(self, unfreeze_layers: int, mode: str = "attn_ln") -> None:
+        self.freeze_backbone()
+        if unfreeze_layers <= 0 or str(mode) == "frozen":
+            return
+
+        layers = self._encoder_layers()
+        if not layers:
+            return
+        selected = layers[max(0, len(layers) - int(unfreeze_layers)):]
+
+        for layer in selected:
+            if str(mode) == "full_block":
+                for p in layer.parameters():
+                    p.requires_grad = True
+                continue
+
+            for name, p in layer.named_parameters():
+                key = str(name).lower()
+                if any(tok in key for tok in ("attention", "attn", "query", "key", "value", "qkv", "norm", "layernorm")):
+                    p.requires_grad = True
+
+        if hasattr(self.backbone, "layernorm"):
+            for p in self.backbone.layernorm.parameters():
+                p.requires_grad = True
+
+    def configure_train_stage(self, epoch: int, *, warmup_epochs: int, train_mode: str) -> None:
+        signature = (int(epoch), int(warmup_epochs), str(train_mode))
+        if signature == self._stage_signature:
+            return
+        if int(epoch) <= int(warmup_epochs):
+            self.freeze_backbone()
+        else:
+            self.apply_finetune_mode(self.unfreeze_layers, mode=str(train_mode))
+        self._stage_signature = signature
 
     def forward(self, crops: torch.Tensor) -> torch.Tensor:
         x = crops

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Dict, List, Tuple
 
 import torch
@@ -21,7 +20,7 @@ from src.engine.metrics import (
 logger = logging.getLogger(__name__)
 
 
-def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, float, Dict[str, float]]:
+def train_epoch(trainer) -> Tuple[float, float, float, float, Dict[str, float]]:
     trainer.model.train()
     trainer.optimizer.zero_grad(set_to_none=True)
 
@@ -54,6 +53,7 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
         iterator = tqdm(iterator, desc=f"Train Epoch {trainer.current_epoch + 1}", leave=True, dynamic_ncols=True)
 
     accum_counter = 0
+    skipped_nonfinite = 0
     for batch_idx, batch in enumerate(iterator):
         batch = trainer._move_batch_to_device(batch)
 
@@ -65,16 +65,11 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
                 target_index=batch["target_index"],
             )
 
-            scene_cat = batch.get("scene_category_idx")
-            if scene_cat is not None and isinstance(scene_cat, torch.Tensor):
-                scene_cat = scene_cat.to(trainer.device)
-
             loss_components = trainer.loss_function.get_loss_components(
                 importance_logits=outputs["importance_logits"],
                 target_index=batch["target_index"],
                 person_mask=batch["person_mask"],
                 model_outputs=outputs,
-                scene_category=scene_cat,
             )
             loss = loss_components["total_loss"] / trainer.accumulation_steps
 
@@ -83,7 +78,14 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
         self_abs_sum += mean_abs_valid(outputs.get("importance_logits_self"), valid_mask)
         rel_abs_sum += mean_abs_valid(outputs.get("importance_logits_rel"), valid_mask)
 
-        if torch.isnan(loss):
+        if not torch.isfinite(loss):
+            skipped_nonfinite += 1
+            if trainer._is_main_process():
+                logger.warning(
+                    "Skipped non-finite train loss at epoch=%d batch=%d",
+                    int(trainer.current_epoch) + 1,
+                    int(batch_idx),
+                )
             trainer.optimizer.zero_grad(set_to_none=True)
             continue
 
@@ -194,16 +196,19 @@ def train_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, floa
 
     avg_imp_loss = epoch_imp_loss / max(1, num_batches)
     avg_pref_loss = epoch_pref_loss / max(1, num_batches)
+    if num_batches == 0:
+        raise RuntimeError("All training batches were skipped due to non-finite loss")
 
     diagnostics = {
         "train_self_logit_abs": self_abs_sum / max(1, num_batches),
         "train_rel_logit_abs": rel_abs_sum / max(1, num_batches),
+        "train_skipped_nonfinite": float(skipped_nonfinite),
     }
     return avg_loss, avg_acc, avg_imp_loss, avg_pref_loss, diagnostics
 
 
 @torch.no_grad()
-def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, float, float, float, float, Dict[str, float]]:
+def validate_epoch(trainer) -> Tuple[float, float, float, float, float, float, float, Dict[str, float]]:
     trainer.model.eval()
 
     epoch_loss = 0.0
@@ -237,10 +242,6 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
     for batch_idx, batch in enumerate(iterator):
         batch = trainer._move_batch_to_device(batch)
 
-        scene_cat = batch.get("scene_category_idx")
-        if scene_cat is not None and isinstance(scene_cat, torch.Tensor):
-            scene_cat = scene_cat.to(trainer.device)
-
         with amp.autocast(device_type=trainer.device.type, enabled=trainer.use_mixed_precision):
             outputs = trainer.model(
                 frames=batch["frames"],
@@ -253,7 +254,6 @@ def validate_epoch(trainer, log_every: int = 10) -> Tuple[float, float, float, f
                 target_index=batch["target_index"],
                 person_mask=batch["person_mask"],
                 model_outputs=outputs,
-                scene_category=scene_cat,
             )
 
         loss_value = float(loss_components["total_loss"].item())

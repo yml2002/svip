@@ -1,8 +1,4 @@
-"""ROI (Region of Interest) crop utilities.
-
-Extracts per-person image patches from video frames using bbox coordinates,
-via grid_sample for differentiable, GPU-native cropping.
-"""
+"""ROI crop utilities."""
 
 from __future__ import annotations
 
@@ -10,37 +6,38 @@ import torch
 import torch.nn.functional as F
 
 
-def roi_crop_valid_batch(
-    frames: torch.Tensor,
-    bboxes: torch.Tensor,
-    person_mask: torch.Tensor,
-    frame_mask: torch.Tensor,
-    out_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Crop person ROIs from frames for all valid (b, t, n) slots.
+_BASE_GRID_CACHE: dict[tuple[str, int, int, str], torch.Tensor] = {}
 
-    Args:
-        frames: (B, T, 3, H, W) float
-        bboxes: (B, T, N, 4) normalized [x1,y1,x2,y2]
-        person_mask: (B, T, N) bool
-        frame_mask: (B, T) bool
-        out_size: output crop size (square)
 
-    Returns:
-        valid_idx: (M, 3) long — indices [b, t, n] for each valid crop
-        crops: (M, 3, out_size, out_size) — cropped image patches
-    """
-    device = frames.device
-    valid = person_mask & frame_mask.unsqueeze(-1)
-    valid_idx = valid.nonzero(as_tuple=False)
-    if valid_idx.numel() == 0:
-        return valid_idx, frames.new_zeros((0, 3, out_size, out_size))
-
-    u = torch.linspace(0, 1, out_size, device=device, dtype=frames.dtype)
-    v = torch.linspace(0, 1, out_size, device=device, dtype=frames.dtype)
+def _get_base_grid(out_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (device.type, int(device.index or -1), int(out_size), str(dtype))
+    base = _BASE_GRID_CACHE.get(key)
+    if base is not None:
+        return base
+    u = torch.linspace(0, 1, out_size, device=device, dtype=dtype)
+    v = torch.linspace(0, 1, out_size, device=device, dtype=dtype)
     grid_y, grid_x = torch.meshgrid(v, u, indexing="ij")
     base = torch.stack([grid_x, grid_y], dim=-1)
+    _BASE_GRID_CACHE[key] = base
+    return base
 
+
+def roi_valid_indices(person_mask: torch.Tensor, frame_mask: torch.Tensor) -> torch.Tensor:
+    valid = person_mask & frame_mask.unsqueeze(-1)
+    return valid.nonzero(as_tuple=False)
+
+
+def roi_crop_from_indices(
+    frames: torch.Tensor,
+    bboxes: torch.Tensor,
+    valid_idx: torch.Tensor,
+    out_size: int,
+) -> torch.Tensor:
+    """Crop ROIs only for the given valid indices."""
+    if valid_idx.numel() == 0:
+        return frames.new_zeros((0, 3, out_size, out_size))
+
+    base = _get_base_grid(out_size, frames.device, frames.dtype)
     b = valid_idx[:, 0]
     t = valid_idx[:, 1]
     n = valid_idx[:, 2]
@@ -53,5 +50,4 @@ def roi_crop_valid_batch(
     gx = x1[:, None, None] + base[None, :, :, 0] * w[:, None, None]
     gy = y1[:, None, None] + base[None, :, :, 1] * h[:, None, None]
     grid = torch.stack([gx * 2 - 1, gy * 2 - 1], dim=-1)
-    crops = F.grid_sample(frames_sel, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-    return valid_idx, crops
+    return F.grid_sample(frames_sel, grid, mode="bilinear", padding_mode="zeros", align_corners=True)

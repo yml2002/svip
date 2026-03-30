@@ -53,6 +53,53 @@ class VideoDataset(Dataset):
 
         logger.info("Loaded %d samples from split=%s", len(self.file_list), self.split)
 
+    def _apply_train_augmentation(
+        self,
+        frames: torch.Tensor,
+        bboxes: torch.Tensor,
+        frame_mask: torch.Tensor,
+        person_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        aug_cfg = getattr(self.config, "augmentation", None)
+        if self.split != "train" or aug_cfg is None or not bool(getattr(aug_cfg, "enabled", False)):
+            return frames, bboxes
+
+        x = frames.to(dtype=torch.float32)
+        boxes = bboxes.to(dtype=torch.float32)
+
+        if torch.rand(1).item() < float(getattr(aug_cfg, "horizontal_flip_prob", 0.0)):
+            x = torch.flip(x, dims=[3])
+            old_x1 = boxes[..., 0].clone()
+            old_x2 = boxes[..., 2].clone()
+            boxes[..., 0] = 1.0 - old_x2
+            boxes[..., 2] = 1.0 - old_x1
+
+        brightness = float(getattr(aug_cfg, "brightness", 0.0))
+        if brightness > 0:
+            factor = 1.0 + (torch.rand(1).item() * 2.0 - 1.0) * brightness
+            x = x * factor
+
+        contrast = float(getattr(aug_cfg, "contrast", 0.0))
+        if contrast > 0:
+            factor = 1.0 + (torch.rand(1).item() * 2.0 - 1.0) * contrast
+            mean = x.mean(dim=(2, 3), keepdim=True)
+            x = (x - mean) * factor + mean
+
+        saturation = float(getattr(aug_cfg, "saturation", 0.0))
+        if saturation > 0:
+            factor = 1.0 + (torch.rand(1).item() * 2.0 - 1.0) * saturation
+            gray = (0.2989 * x[:, 0:1] + 0.5870 * x[:, 1:2] + 0.1140 * x[:, 2:3])
+            x = gray + (x - gray) * factor
+
+        noise_std = float(getattr(aug_cfg, "noise_std", 0.0))
+        if noise_std > 0 and torch.rand(1).item() < 0.5:
+            x = x + torch.randn_like(x) * noise_std
+
+        x = x.clamp(0.0, 1.0)
+        x = x.masked_fill(~frame_mask[:, None, None, None], 0.0)
+        boxes = boxes.clamp(0.0, 1.0).masked_fill(~person_mask.unsqueeze(-1), 0.0)
+        return x.to(dtype=frames.dtype), boxes.to(dtype=bboxes.dtype)
+
     def _resample_temporal_arrays(
         self,
         *,
@@ -222,6 +269,12 @@ class VideoDataset(Dataset):
         frame_tensor[~frame_mask_tensor] = 0.0
         person_mask_tensor = person_mask_tensor & frame_mask_tensor.unsqueeze(-1)
         bbox_tensor = bbox_tensor.masked_fill(~person_mask_tensor.unsqueeze(-1), 0.0)
+        frame_tensor, bbox_tensor = self._apply_train_augmentation(
+            frame_tensor,
+            bbox_tensor,
+            frame_mask_tensor,
+            person_mask_tensor,
+        )
 
         return {
             "frames": frame_tensor,
@@ -233,5 +286,4 @@ class VideoDataset(Dataset):
             "target_index": torch.tensor(int(target_index_int), dtype=torch.int64),
             "video_id": video_id,
             "scene_category": scene_category,
-            "scene_category_idx": torch.tensor(int(scene_category) - 1, dtype=torch.int64),
         }

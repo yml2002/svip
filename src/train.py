@@ -103,7 +103,6 @@ def parse_args(argv=None):
     parser.add_argument("--num_workers", "-w", type=int, default=int(base_config.training.num_workers))
     parser.add_argument("--roi_chunk", type=int, default=None)
     parser.add_argument("--data_ratio", type=float, default=None)
-    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--validate_only", action="store_true")
     parser.add_argument("--early_stop", type=int, default=None)
@@ -111,33 +110,31 @@ def parse_args(argv=None):
     # Loss weights
     parser.add_argument("--importance_weight", type=float, default=None)
     parser.add_argument("--preference_weight", type=float, default=None)
+    parser.add_argument("--relation_delta_scale", type=float, default=None)
+    parser.add_argument("--no_counterfactual", action="store_true")
     # Architecture toggles
     parser.add_argument("--no_gat", action="store_true")
     parser.add_argument("--no_spatial_edges", action="store_true")
     parser.add_argument("--no_temporal_edges", action="store_true")
     parser.add_argument("--no_edge_features", action="store_true")
     parser.add_argument("--no_geom", action="store_true")
-    parser.add_argument("--graph_type", type=str, default=None, choices=["gatv2", "gcn"])
+    parser.add_argument("--mean_only_unary", action="store_true")
     parser.add_argument("--gat_topk_neighbors", type=int, default=None)
-    parser.add_argument("--gat_num_layers", type=int, default=None)
-    parser.add_argument("--gat_heads", type=int, default=None)
-    parser.add_argument("--temporal_window", type=int, default=None)
-    parser.add_argument("--self_enabled", type=int, choices=[0, 1], default=None)
     parser.add_argument("--relation_enabled", type=int, choices=[0, 1], default=None)
     parser.add_argument("--unfreeze_layers", type=int, default=None)
-    parser.add_argument("--logit_temperature", type=float, default=None)
 
     parser.add_argument("--backbone_lr_scale", type=float, default=None,
-                        help="Backbone LR = learning_rate * this scale (default: 0.2)")
+                        help="Backbone LR = learning_rate * this scale")
+    parser.add_argument("--backbone_warmup_epochs", type=int, default=None)
+    parser.add_argument("--backbone_train_mode", type=str, default=None,
+                        choices=["frozen", "attn_ln", "full_block"])
 
-    # Global context (KCGC)
+    # Open-world scene context
     parser.add_argument("--no_global_context", action="store_true",
-                        help="Disable Keyframe-Conditioned Global Context")
+                        help="Disable scene context conditioning")
     parser.add_argument("--global_num_keyframes", type=int, default=None,
-                        help=f"Number of keyframes for KCGC (config default: {base_config.model.global_context.num_keyframes})")
-
-    parser.add_argument("--swap_splits", action="store_true")
-    parser.add_argument("--swap_fraction", type=float, default=0.5)
+                        help=f"Number of keyframes for scene context (config default: {base_config.model.global_context.num_keyframes})")
+    parser.add_argument("--global_num_prototypes", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None,
                         help=f"Random seed (config default: {base_config.training.seed})")
 
