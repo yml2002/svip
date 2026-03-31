@@ -119,14 +119,14 @@ class Trainer:
             backbone_total += int(p.numel())
             if p.requires_grad:
                 backbone_trainable += int(p.numel())
-        if backbone_total > 0:
-            logger.info(
-                "Epoch %d: backbone_trainable=%d/%d (%.2f%%)",
-                int(epoch),
-                int(backbone_trainable),
-                int(backbone_total),
-                100.0 * float(backbone_trainable) / float(backbone_total),
-            )
+        # if backbone_total > 0:
+        #     logger.info(
+        #         "Epoch %d: backbone_trainable=%d/%d (%.2f%%)",
+        #         int(epoch),
+        #         int(backbone_trainable),
+        #         int(backbone_total),
+        #         100.0 * float(backbone_trainable) / float(backbone_total),
+        #     )
 
     def _is_main_process(self) -> bool:
         return self.rank == 0

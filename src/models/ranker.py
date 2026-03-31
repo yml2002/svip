@@ -45,7 +45,7 @@ class PersonRanker(nn.Module):
         self.use_relation_branch = bool(getattr(config.model.relation, "enabled", True))
         self.relation_delta_scale = float(getattr(config.model.relation, "delta_scale", 1.0))
         self.use_adaptive_gate = bool(getattr(config.model.relation, "use_adaptive_gate", True))
-        self.use_counterfactual = bool(getattr(config.model.counterfactual, "enabled", True))
+        self.relation_gate_bias = float(getattr(config.model.relation, "gate_bias", 0.90))
         self.use_geom = bool(getattr(geom_cfg, "enabled", True))
         self.geom_fuse_scale = float(getattr(geom_cfg, "fuse_scale", 0.5))
         self.geom_dropout_prob = float(getattr(geom_cfg, "dropout_prob", 0.0))
@@ -103,9 +103,15 @@ class PersonRanker(nn.Module):
                 )
             relation_feat_dim = int(getattr(self.relation, "out_dim", int(gat_cfg.hidden_dim)))
             self.relation_gate_rel_proj = nn.Linear(relation_feat_dim, int(sc_cfg.hidden_dim))
+            self.scene_gate_proj = nn.Sequential(
+                nn.LayerNorm(int(gc_cfg.context_dim)),
+                nn.Linear(int(gc_cfg.context_dim), int(sc_cfg.hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(sc_cfg.hidden_dim), int(sc_cfg.hidden_dim)),
+            )
             self.relation_gate = nn.Sequential(
-                nn.LayerNorm(int(sc_cfg.hidden_dim) * 2 + int(gc_cfg.context_dim)),
-                nn.Linear(int(sc_cfg.hidden_dim) * 2 + int(gc_cfg.context_dim), int(sc_cfg.hidden_dim)),
+                nn.LayerNorm(int(sc_cfg.hidden_dim) * 3),
+                nn.Linear(int(sc_cfg.hidden_dim) * 3, int(sc_cfg.hidden_dim)),
                 nn.GELU(),
                 nn.Dropout(float(config.model.dropout.scoring)),
                 nn.Linear(int(sc_cfg.hidden_dim), 1),
@@ -114,6 +120,7 @@ class PersonRanker(nn.Module):
             self.relation = None
             self.relation_gate = None
             self.relation_gate_rel_proj = None
+            self.scene_gate_proj = None
 
         if bool(getattr(gc_cfg, "enabled", True)):
             T_sampled = int(config.data.sampled_frames)
@@ -208,12 +215,13 @@ class PersonRanker(nn.Module):
                 relation_delta, relation_feat = self._maybe_checkpoint(self.relation, fused, pm, scene_token)
             if self.global_ctx is not None and self.relation_gate is not None and self.use_adaptive_gate:
                 rel_gate_feat = self.relation_gate_rel_proj(relation_feat)
+                scene_gate_feat = self.scene_gate_proj(scene_token)
                 gate_input = torch.cat([
                     intrinsic_feat,
                     rel_gate_feat,
-                    scene_token[:, None, :].expand(-1, N, -1).to(dtype=intrinsic_feat.dtype),
+                    scene_gate_feat[:, None, :].expand(-1, N, -1).to(dtype=intrinsic_feat.dtype),
                 ], dim=-1)
-                relation_gate = 1.0 + 0.25 * torch.tanh(self.relation_gate(gate_input).squeeze(-1))
+                relation_gate = self.relation_gate_bias + 0.15 * torch.tanh(self.relation_gate(gate_input).squeeze(-1))
                 relation_gate = relation_gate.masked_fill(~valid_mask, 0.0)
             else:
                 relation_gate = fused.new_ones((B, N)) * valid_mask.float()
@@ -224,31 +232,6 @@ class PersonRanker(nn.Module):
             relation_delta = fused.new_zeros((B, N))
             relation_gate = fused.new_zeros((B, N))
             rel_scores = fused.new_zeros((B, N))
-
-        cf_no_relation_logits = None
-        cf_no_scene_logits = None
-        if self.training and self.use_counterfactual and self.use_relation_branch:
-            cf_no_relation_logits = intrinsic_logits.masked_fill(~valid_mask, -1e4)
-            zero_scene = torch.zeros_like(scene_token)
-            if self.use_social_gat:
-                cf_relation_delta, cf_relation_feat = self._maybe_checkpoint(self.relation, fused, pm, bboxes.to(dtype=fused.dtype), zero_scene)
-            else:
-                cf_relation_delta, cf_relation_feat = self._maybe_checkpoint(self.relation, fused, pm, zero_scene)
-
-            if self.use_adaptive_gate and self.relation_gate is not None:
-                cf_rel_gate_feat = self.relation_gate_rel_proj(cf_relation_feat)
-                cf_gate_input = torch.cat([
-                    intrinsic_feat,
-                    cf_rel_gate_feat,
-                    zero_scene[:, None, :].expand(-1, N, -1).to(dtype=intrinsic_feat.dtype),
-                ], dim=-1)
-                cf_relation_gate = 1.0 + 0.25 * torch.tanh(self.relation_gate(cf_gate_input).squeeze(-1))
-                cf_relation_gate = cf_relation_gate.masked_fill(~valid_mask, 0.0)
-            else:
-                cf_relation_gate = fused.new_ones((B, N)) * valid_mask.float()
-
-            cf_rel_scores = cf_relation_gate * (self.relation_delta_scale * cf_relation_delta)
-            cf_no_scene_logits = (intrinsic_logits + cf_rel_scores).masked_fill(~valid_mask, -1e4)
 
         logits = intrinsic_logits + rel_scores
         logits = logits.masked_fill(~valid_mask, -1e4)
@@ -269,6 +252,4 @@ class PersonRanker(nn.Module):
             "scene_logits": scene_logits,
             "scene_token": scene_token,
             "scene_tokens": scene_tokens,
-            "cf_no_relation_logits": cf_no_relation_logits,
-            "cf_no_scene_logits": cf_no_scene_logits,
         }

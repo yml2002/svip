@@ -1,7 +1,7 @@
 """Loss functions.
 
-The final rank score remains primary, but we now add light supervision to the
-intrinsic branch and the scene prior so each module keeps a clear job.
+The final rank score remains primary, with light auxiliary supervision for the
+unary and relation branches plus weak prototype consistency for scene context.
 """
 
 from __future__ import annotations
@@ -82,20 +82,13 @@ class CombinedLoss(nn.Module):
         self.intrinsic_aux_weight = float(getattr(config.model.loss, "intrinsic_aux_weight", 0.0))
         self.relation_aux_weight = float(getattr(config.model.loss, "relation_aux_weight", 0.0))
         self.scene_consistency_weight = float(getattr(config.model.loss, "scene_consistency_weight", 0.0))
-        self.cf_enabled = bool(getattr(config.model.counterfactual, "enabled", True))
-        self.cf_relation_weight = float(getattr(config.model.counterfactual, "relation_weight", 0.0))
-        self.cf_scene_weight = float(getattr(config.model.counterfactual, "scene_weight", 0.0))
-        self.cf_relation_margin = float(getattr(config.model.counterfactual, "relation_margin", 0.0))
-        self.cf_scene_margin = float(getattr(config.model.counterfactual, "scene_margin", 0.0))
         logger.info(
-            "CombinedLoss: imp=%.3f pref=%.3f intrinsic=%.3f relation=%.3f scene=%.3f cf_rel=%.3f cf_scene=%.3f beta=%.3f",
+            "CombinedLoss: imp=%.3f pref=%.3f intrinsic=%.3f relation=%.3f scene=%.3f beta=%.3f",
             self.importance_weight,
             self.preference_weight,
             self.intrinsic_aux_weight,
             self.relation_aux_weight,
             self.scene_consistency_weight,
-            self.cf_relation_weight,
-            self.cf_scene_weight,
             beta_cfg,
         )
 
@@ -146,27 +139,7 @@ class CombinedLoss(nn.Module):
         else:
             scene_loss = importance_logits.new_tensor(0.0)
 
-        if self.cf_enabled and model_outputs is not None:
-            full_margin = _ranking_margin(importance_logits, target_index, person_mask)
-
-            cf_no_relation_logits = model_outputs.get("cf_no_relation_logits")
-            if cf_no_relation_logits is not None and self.cf_relation_weight > 0:
-                cf_relation_margin = _ranking_margin(cf_no_relation_logits, target_index, person_mask)
-                cf_relation_loss = F.relu(self.cf_relation_margin - (full_margin - cf_relation_margin)).mean() * self.cf_relation_weight
-            else:
-                cf_relation_loss = importance_logits.new_tensor(0.0)
-
-            cf_no_scene_logits = model_outputs.get("cf_no_scene_logits")
-            if cf_no_scene_logits is not None and self.cf_scene_weight > 0:
-                cf_scene_margin = _ranking_margin(cf_no_scene_logits, target_index, person_mask)
-                cf_scene_loss = F.relu(self.cf_scene_margin - (full_margin - cf_scene_margin)).mean() * self.cf_scene_weight
-            else:
-                cf_scene_loss = importance_logits.new_tensor(0.0)
-        else:
-            cf_relation_loss = importance_logits.new_tensor(0.0)
-            cf_scene_loss = importance_logits.new_tensor(0.0)
-
-        total = imp_loss + pref_loss + intrinsic_aux_loss + relation_aux_loss + scene_loss + cf_relation_loss + cf_scene_loss
+        total = imp_loss + pref_loss + intrinsic_aux_loss + relation_aux_loss + scene_loss
 
         return {
             "importance_loss": imp_loss.detach(),
@@ -174,7 +147,5 @@ class CombinedLoss(nn.Module):
             "intrinsic_aux_loss": intrinsic_aux_loss.detach(),
             "relation_aux_loss": relation_aux_loss.detach(),
             "scene_loss": scene_loss.detach(),
-            "cf_relation_loss": cf_relation_loss.detach(),
-            "cf_scene_loss": cf_scene_loss.detach(),
             "total_loss": total,
         }

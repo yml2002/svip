@@ -95,15 +95,7 @@ class RelationConfig:
     enabled: bool = True
     delta_scale: float = 0.85
     use_adaptive_gate: bool = True
-
-
-@dataclass
-class CounterfactualConfig:
-    enabled: bool = True
-    relation_weight: float = 0.20
-    scene_weight: float = 0.12
-    relation_margin: float = 0.15
-    scene_margin: float = 0.08
+    gate_bias: float = 0.90
 
 
 @dataclass
@@ -112,8 +104,8 @@ class LossConfig:
     importance_weight: float = 1.0
     preference_weight: float = 0.25
     intrinsic_aux_weight: float = 0.20
-    relation_aux_weight: float = 0.20
-    scene_consistency_weight: float = 0.10
+    relation_aux_weight: float = 0.05
+    scene_consistency_weight: float = 0.02
 
 
 @dataclass
@@ -136,7 +128,6 @@ class ModelConfig:
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
     intrinsic: IntrinsicConfig = field(default_factory=IntrinsicConfig)
     relation: RelationConfig = field(default_factory=RelationConfig)
-    counterfactual: CounterfactualConfig = field(default_factory=CounterfactualConfig)
     global_context: GlobalContextConfig = field(default_factory=GlobalContextConfig)
     loss: LossConfig = field(default_factory=LossConfig)
 

@@ -111,7 +111,6 @@ def parse_args(argv=None):
     parser.add_argument("--importance_weight", type=float, default=None)
     parser.add_argument("--preference_weight", type=float, default=None)
     parser.add_argument("--relation_delta_scale", type=float, default=None)
-    parser.add_argument("--no_counterfactual", action="store_true")
     # Architecture toggles
     parser.add_argument("--no_gat", action="store_true")
     parser.add_argument("--no_spatial_edges", action="store_true")

@@ -1,9 +1,8 @@
 """Temporal social memory relation reasoning.
 
-This branch refines person-centric importance with history-aware social cues.
-At each frame, pairwise spatial relations are built from current features and
-the previous social memory state, so historical interaction patterns can affect
-how the current frame is interpreted.
+Scene context does not inject person-level content directly. Instead, it modulates
+which spatial interaction cues and temporal interaction patterns should matter in
+the current environment.
 """
 
 from __future__ import annotations
@@ -84,13 +83,16 @@ class SocialMemoryLayer(nn.Module):
         self.k_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.v_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.self_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.scene_q = nn.Linear(int(scene_dim), self.hidden_dim)
-        self.scene_v = nn.Linear(int(scene_dim), self.hidden_dim)
+        self.scene_edge_gate = nn.Sequential(
+            nn.LayerNorm(int(scene_dim)),
+            nn.Linear(int(scene_dim), 6),
+            nn.Tanh(),
+        )
         self.edge_bias = nn.Linear(6, self.heads) if self.use_edge_features else None
         self.stats_proj = nn.Linear(4, self.hidden_dim)
         self.update_mlp = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim * 5),
-            nn.Linear(self.hidden_dim * 5, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim * 4),
+            nn.Linear(self.hidden_dim * 4, self.hidden_dim),
             nn.GELU(),
             nn.Dropout(float(dropout)),
         )
@@ -151,8 +153,6 @@ class SocialMemoryLayer(nn.Module):
             q = self.q_proj(node).view(bsz, n_person, self.heads, self.head_dim).permute(0, 2, 1, 3)
             k = self.k_proj(node).view(bsz, n_person, self.heads, self.head_dim).permute(0, 2, 1, 3)
             v = self.v_proj(node).view(bsz, n_person, self.heads, self.head_dim).permute(0, 2, 1, 3)
-            scene_shift = self.scene_q(scene_token).view(bsz, self.heads, self.head_dim).unsqueeze(2)
-            q = q + scene_shift
 
             if self.graph_type == "gcn":
                 edge_gate = neighbor_mask.unsqueeze(1).to(dtype=node.dtype)
@@ -160,6 +160,8 @@ class SocialMemoryLayer(nn.Module):
                 scores = torch.einsum("bhid,bhjd->bhij", q, k) / math.sqrt(float(self.head_dim))
                 if self.edge_bias is not None:
                     pair_feat = _bbox_pair_features(bboxes_t).to(dtype=torch.float32)
+                    scene_edge = 1.0 + 0.35 * self.scene_edge_gate(scene_token).unsqueeze(1).unsqueeze(1)
+                    pair_feat = pair_feat * scene_edge.to(dtype=pair_feat.dtype)
                     pair_bias = self.edge_bias(pair_feat).to(dtype=scores.dtype).permute(0, 3, 1, 2)
                     scores = scores + pair_bias
                 scores = scores.masked_fill(~neighbor_mask.unsqueeze(1), -20.0)
@@ -181,14 +183,12 @@ class SocialMemoryLayer(nn.Module):
             focality = incoming_strength - outgoing_strength
             stats = torch.stack([incoming_strength, outgoing_strength, reciprocal, focality], dim=-1)
 
-        scene_value = self.scene_v(scene_token).unsqueeze(1).expand(-1, n_person, -1)
         update_input = torch.cat(
             [
                 self.self_proj(node),
                 incoming_msg,
                 outgoing_msg,
                 self.stats_proj(stats),
-                scene_value,
             ],
             dim=-1,
         )
@@ -238,13 +238,18 @@ class TemporalSocialMemoryEncoder(nn.Module):
             for _ in range(int(num_layers))
         ])
         self.temporal_attn = nn.Sequential(
-            nn.Linear(int(hidden_dim) + self.stat_dim + int(scene_dim), int(hidden_dim) // 2),
+            nn.Linear(int(hidden_dim) + self.stat_dim, int(hidden_dim) // 2),
             nn.GELU(),
             nn.Linear(int(hidden_dim) // 2, 1),
         )
+        self.scene_time_gate = nn.Sequential(
+            nn.LayerNorm(int(scene_dim)),
+            nn.Linear(int(scene_dim), int(hidden_dim)),
+            nn.Tanh(),
+        )
         self.delta_head = nn.Sequential(
-            nn.LayerNorm(int(hidden_dim) + self.stat_dim + int(scene_dim)),
-            nn.Linear(int(hidden_dim) + self.stat_dim + int(scene_dim), int(hidden_dim)),
+            nn.LayerNorm(int(hidden_dim) + self.stat_dim),
+            nn.Linear(int(hidden_dim) + self.stat_dim, int(hidden_dim)),
             nn.GELU(),
             nn.Dropout(float(dropout)),
             nn.Linear(int(hidden_dim), 1),
@@ -281,20 +286,18 @@ class TemporalSocialMemoryEncoder(nn.Module):
             stats_seq = stats_seq + torch.stack(layer_stats, dim=1)
 
         stats_seq = stats_seq / max(1, len(self.layers))
-        scene_expand = scene_token[:, None, None, :].expand(bsz, total_t, n_person, -1).to(dtype=h.dtype)
-        attn_input = torch.cat([h, stats_seq.to(dtype=h.dtype), scene_expand], dim=-1)
+        time_gate = self.scene_time_gate(scene_token).unsqueeze(1).unsqueeze(1).to(dtype=h.dtype)
+        gated_h = h * (1.0 + 0.2 * time_gate)
+        attn_input = torch.cat([gated_h, stats_seq.to(dtype=h.dtype)], dim=-1)
         attn_logits = self.temporal_attn(attn_input).squeeze(-1)
         attn_logits = attn_logits.masked_fill(~person_mask, -1e4)
         attn = torch.softmax(attn_logits.permute(0, 2, 1), dim=-1)
         attn = attn * person_mask.permute(0, 2, 1).to(dtype=attn.dtype)
         attn = attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
 
-        pooled_feat = (h.permute(0, 2, 1, 3) * attn.unsqueeze(-1)).sum(dim=2)
+        pooled_feat = (gated_h.permute(0, 2, 1, 3) * attn.unsqueeze(-1)).sum(dim=2)
         pooled_stats = (stats_seq.permute(0, 2, 1, 3).to(dtype=attn.dtype) * attn.unsqueeze(-1)).sum(dim=2)
-        delta_input = torch.cat(
-            [pooled_feat, pooled_stats.to(dtype=pooled_feat.dtype), scene_token[:, None, :].expand(-1, n_person, -1).to(dtype=pooled_feat.dtype)],
-            dim=-1,
-        )
+        delta_input = torch.cat([pooled_feat, pooled_stats.to(dtype=pooled_feat.dtype)], dim=-1)
         relation_delta = self.delta_head(delta_input).squeeze(-1)
         valid_person = person_mask.any(dim=1)
         relation_delta = relation_delta.masked_fill(~valid_person, 0.0)
@@ -308,13 +311,18 @@ class UnaryRelationHead(nn.Module):
         self.out_dim = int(hidden_dim)
         self.proj = nn.Linear(int(in_dim), int(hidden_dim))
         self.temporal_attn = nn.Sequential(
-            nn.Linear(int(hidden_dim) + int(scene_dim), int(hidden_dim) // 2),
+            nn.Linear(int(hidden_dim), int(hidden_dim) // 2),
             nn.GELU(),
             nn.Linear(int(hidden_dim) // 2, 1),
         )
+        self.scene_time_gate = nn.Sequential(
+            nn.LayerNorm(int(scene_dim)),
+            nn.Linear(int(scene_dim), int(hidden_dim)),
+            nn.Tanh(),
+        )
         self.out = nn.Sequential(
-            nn.LayerNorm(int(hidden_dim) + int(scene_dim)),
-            nn.Linear(int(hidden_dim) + int(scene_dim), int(hidden_dim)),
+            nn.LayerNorm(int(hidden_dim)),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
             nn.GELU(),
             nn.Dropout(float(dropout)),
             nn.Linear(int(hidden_dim), 1),
@@ -323,15 +331,15 @@ class UnaryRelationHead(nn.Module):
     def forward(self, fused: torch.Tensor, person_mask: torch.Tensor, scene_token: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         bsz, total_t, n_person, _ = fused.shape
         h = self.proj(fused).masked_fill(~person_mask.unsqueeze(-1), 0.0)
-        scene_expand = scene_token[:, None, None, :].expand(bsz, total_t, n_person, -1).to(dtype=h.dtype)
-        attn_logits = self.temporal_attn(torch.cat([h, scene_expand], dim=-1)).squeeze(-1)
+        time_gate = self.scene_time_gate(scene_token).unsqueeze(1).unsqueeze(1).to(dtype=h.dtype)
+        gated_h = h * (1.0 + 0.2 * time_gate)
+        attn_logits = self.temporal_attn(gated_h).squeeze(-1)
         attn_logits = attn_logits.masked_fill(~person_mask, -1e4)
         attn = torch.softmax(attn_logits.permute(0, 2, 1), dim=-1)
         attn = attn * person_mask.permute(0, 2, 1).to(dtype=attn.dtype)
         attn = attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-        person_feat = (h.permute(0, 2, 1, 3) * attn.unsqueeze(-1)).sum(dim=2)
-        out_input = torch.cat([person_feat, scene_token[:, None, :].expand(-1, n_person, -1).to(dtype=person_feat.dtype)], dim=-1)
-        relation_delta = self.out(out_input).squeeze(-1)
+        person_feat = (gated_h.permute(0, 2, 1, 3) * attn.unsqueeze(-1)).sum(dim=2)
+        relation_delta = self.out(person_feat).squeeze(-1)
         valid_person = person_mask.any(dim=1)
         relation_delta = relation_delta.masked_fill(~valid_person, 0.0)
         person_feat = person_feat.masked_fill(~valid_person.unsqueeze(-1), 0.0)

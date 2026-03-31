@@ -42,7 +42,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # ============================================================
 ABLATION_CONFIGS = {
     "full_model":                           {},
-    "wo_counterfactual_regularization": {"--no_counterfactual": None},
     "wo_relation_refinement":          {"--relation_enabled": "0"},
     "wo_scene_context_conditioning":   {"--no_global_context": None},
     "wo_temporal_social_memory":       {"--no_temporal_edges": None},
@@ -52,7 +51,6 @@ ABLATION_CONFIGS = {
 }
 ABLATION_ORDER = [
     "full_model",
-    "wo_counterfactual_regularization",
     "wo_relation_refinement",
     "wo_scene_context_conditioning",
     "wo_temporal_social_memory",

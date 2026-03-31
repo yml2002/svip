@@ -207,8 +207,6 @@ class TrainingRuntime:
             config.model.loss.preference_weight = float(self.args.preference_weight)
         if getattr(self.args, "relation_delta_scale", None) is not None:
             config.model.relation.delta_scale = float(self.args.relation_delta_scale)
-        if bool(getattr(self.args, "no_counterfactual", False)):
-            config.model.counterfactual.enabled = False
         if bool(getattr(self.args, "no_gat", False)):
             config.model.gatv2.enabled = False
         if bool(getattr(self.args, "no_spatial_edges", False)):

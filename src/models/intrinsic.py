@@ -88,6 +88,13 @@ class IntrinsicImportanceModule(nn.Module):
             nn.LayerNorm(int(hidden_dim)),
             nn.GELU(),
         )
+        self.dynamic_residual = nn.Sequential(
+            nn.LayerNorm(int(hidden_dim) * 2 + self.prior_dim),
+            nn.Linear(int(hidden_dim) * 2 + self.prior_dim, int(hidden_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+        )
         self.scorer = nn.Sequential(
             nn.Dropout(float(dropout)),
             nn.Linear(int(hidden_dim), 1),
@@ -171,7 +178,11 @@ class IntrinsicImportanceModule(nn.Module):
         selector = torch.softmax(selector_logits, dim=-1)
         pool_stack = torch.stack([mean_pool, max_pool, attn_pool], dim=2)
         mixed_pool = (pool_stack * selector.unsqueeze(-1)).sum(dim=2)
+        dynamic_feat = torch.cat([attn_pool - mean_pool, max_pool - mean_pool], dim=-1)
         intrinsic_feat = self.encoder(torch.cat([mixed_pool, priors.to(dtype=h.dtype)], dim=-1))
+        intrinsic_feat = intrinsic_feat + self.dynamic_residual(
+            torch.cat([dynamic_feat, priors.to(dtype=h.dtype)], dim=-1)
+        )
         intrinsic_logits = self.scorer(intrinsic_feat).squeeze(-1)
         intrinsic_logits = intrinsic_logits.masked_fill(~valid_person, -1e4)
         intrinsic_feat = intrinsic_feat.masked_fill(~valid_person.unsqueeze(-1), 0.0)
